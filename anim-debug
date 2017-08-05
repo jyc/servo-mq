@@ -1,0 +1,104 @@
+# HG changeset patch
+# Parent  67732e2e0b174d6d81f1e0a7b8130c3607fb0da0
+
+diff -r 67732e2e0b17 -r 1b6c63972c06 components/layout/animation.rs
+--- a/components/layout/animation.rs	Wed Aug 02 10:32:18 2017 -0700
++++ b/components/layout/animation.rs	Fri Aug 04 18:33:58 2017 -0700
+@@ -159,16 +159,17 @@ pub fn recalc_style_for_animations(conte
+                 update_style_for_animation(&context.style_context,
+                                            animation,
+                                            &mut fragment.style,
+                                            &ServoMetricsProvider);
+                 let difference =
+                     RestyleDamage::compute_style_difference(&old_style,
+                                                             &old_style,
+                                                             &fragment.style);
++                println!("difference: {}", difference.damage);
+                 damage |= difference.damage;
+             }
+         }
+     });
+ 
+     let base = flow::mut_base(flow);
+     base.restyle_damage.insert(damage);
+     for kid in base.children.iter_mut() {
+diff -r 67732e2e0b17 -r 1b6c63972c06 components/layout_thread/lib.rs
+--- a/components/layout_thread/lib.rs	Wed Aug 02 10:32:18 2017 -0700
++++ b/components/layout_thread/lib.rs	Fri Aug 04 18:33:58 2017 -0700
+@@ -1587,16 +1587,17 @@ impl LayoutThread {
+         profile(time::ProfilerCategory::LayoutFloatPlacementSpeculation,
+                 self.profiler_metadata(),
+                 self.time_profiler_chan.clone(),
+                 || sequential::guess_float_placement(FlowRef::deref_mut(root_flow)));
+ 
+         // Perform the primary layout passes over the flow tree to compute the locations of all
+         // the boxes.
+         if flow::base(&**root_flow).restyle_damage.intersects(REFLOW | REFLOW_OUT_OF_FLOW) {
++            println!("solving constraints");
+             profile(time::ProfilerCategory::LayoutMain,
+                     self.profiler_metadata(),
+                     self.time_profiler_chan.clone(),
+                     || {
+                 let profiler_metadata = self.profiler_metadata();
+ 
+                 if let (true, Some(traversal)) = (self.parallel_flag, self.parallel_traversal.as_ref()) {
+                     // Parallel mode.
+diff -r 67732e2e0b17 -r 1b6c63972c06 components/style/properties/helpers/animated_properties.mako.rs
+--- a/components/style/properties/helpers/animated_properties.mako.rs	Wed Aug 02 10:32:18 2017 -0700
++++ b/components/style/properties/helpers/animated_properties.mako.rs	Fri Aug 04 18:33:58 2017 -0700
+@@ -390,16 +390,17 @@ pub enum AnimatedProperty {
+                     value_type = "longhands::{}::computed_value::T".format(prop.ident)
+                 else:
+                     value_type = prop.animation_value_type
+             %>
+             /// ${prop.name}
+             ${prop.camel_case}(${value_type}, ${value_type}),
+         % endif
+     % endfor
++    //Custom(::custom_properties::name, 
+ }
+ 
+ impl AnimatedProperty {
+     /// Get the name of this property.
+     pub fn name(&self) -> &'static str {
+         match *self {
+             % for prop in data.longhands:
+                 % if prop.animatable:
+@@ -434,34 +435,37 @@ impl AnimatedProperty {
+             % endfor
+             _ => false,
+         }
+     }
+ 
+     /// Update `style` with the proper computed style corresponding to this
+     /// animation at `progress`.
+     pub fn update(&self, style: &mut ComputedValues, progress: f64) {
++        println!("AnimatedProperty::update(self={:?}, progress={}..)", self, progress);
+         match *self {
+             % for prop in data.longhands:
+                 % if prop.animatable:
+                     AnimatedProperty::${prop.camel_case}(ref from, ref to) => {
+                         // https://w3c.github.io/web-animations/#discrete-animation-type
+                         % if prop.animation_value_type == "discrete":
+                             let value = if progress < 0.5 { from.clone() } else { to.clone() };
+                         % else:
+                             let value = match from.interpolate(to, progress) {
+                                 Ok(value) => value,
+                                 Err(()) => return,
+                             };
++                        println!("AnimatedProperty::update value={:?}", value);
+                         % endif
+                         % if not prop.is_animatable_with_computed_value:
+                             let value: longhands::${prop.ident}::computed_value::T =
+                                 ToAnimatedValue::from_animated_value(value);
+                         % endif
+                         style.mutate_${prop.style_struct.name_lower}().set_${prop.ident}(value);
++                        println!("value'={:?}", style.mutate_${prop.style_struct.name_lower}().clone_${prop.ident}());
+                     }
+                 % endif
+             % endfor
+         }
+     }
+ 
+     /// Get an animatable value from a transition-property, an old style, and a
+     /// new style.
