@@ -1,0 +1,3772 @@
+# HG changeset patch
+# Parent  e64e219e7de0753e0dc64e159c8041068757ad24
+
+diff -r f1007237a8b4 ports/geckolib/glue.rs
+--- a/ports/geckolib/glue.rs	Mon Jul 10 11:33:04 2017 -0700
++++ b/ports/geckolib/glue.rs	Tue Jul 11 20:25:08 2017 -0700
+@@ -734,17 +734,19 @@ pub extern "C" fn Servo_StyleWorkerThrea
+ }
+ 
+ #[no_mangle]
+ pub extern "C" fn Servo_Element_ClearData(element: RawGeckoElementBorrowed) {
+     GeckoElement(element).clear_data();
+ }
+ 
+ #[no_mangle]
+-pub extern "C" fn Servo_StyleSheet_Empty(mode: SheetParsingMode) -> RawServoStyleSheetContentsStrong {
++pub extern "C" fn Servo_StyleSheet_Empty(mode: SheetParsingMode,
++                                         raw_data: RawServoStyleSetBorrowed)
++                                         -> RawServoStyleSheetContentsStrong {
+     let global_style_data = &*GLOBAL_STYLE_DATA;
+     let origin = match mode {
+         SheetParsingMode::eAuthorSheetFeatures => Origin::Author,
+         SheetParsingMode::eUserSheetFeatures => Origin::User,
+         SheetParsingMode::eAgentSheetFeatures => Origin::UserAgent,
+         SheetParsingMode::eSafeAgentSheetFeatures => Origin::UserAgent,
+     };
+     let shared_lock = &global_style_data.shared_lock;
+@@ -752,30 +754,32 @@ pub extern "C" fn Servo_StyleSheet_Empty
+         StylesheetContents::from_str(
+             "",
+             unsafe { dummy_url_data() }.clone(),
+             origin,
+             shared_lock,
+             /* loader = */ None,
+             &RustLogReporter,
+             QuirksMode::NoQuirks,
+-            0
++            0,
++            Some(PerDocumentStyleData::from_ffi(raw_data).borrow().registered_property_set.clone(),
+         )
+     ).into_strong()
+ }
+ 
+ #[no_mangle]
+ pub extern "C" fn Servo_StyleSheet_FromUTF8Bytes(
+     loader: *mut Loader,
+     stylesheet: *mut ServoStyleSheet,
+     data: *const nsACString,
+     mode: SheetParsingMode,
+     extra_data: *mut URLExtraData,
+     line_number_offset: u32,
+-    quirks_mode: nsCompatibility
++    quirks_mode: nsCompatibility,
++    raw_data: RawServoStyleSetBorrowed
+ ) -> RawServoStyleSheetContentsStrong {
+     let global_style_data = &*GLOBAL_STYLE_DATA;
+     let input = unsafe { data.as_ref().unwrap().as_str_unchecked() };
+ 
+     let origin = match mode {
+         SheetParsingMode::eAuthorSheetFeatures => Origin::Author,
+         SheetParsingMode::eUserSheetFeatures => Origin::User,
+         SheetParsingMode::eAgentSheetFeatures => Origin::UserAgent,
+@@ -794,17 +798,19 @@ pub extern "C" fn Servo_StyleSheet_FromU
+         None => None,
+         Some(ref s) => Some(s),
+     };
+ 
+ 
+     Arc::new(StylesheetContents::from_str(
+         input, url_data.clone(), origin,
+         &global_style_data.shared_lock, loader, &RustLogReporter,
+-        quirks_mode.into(), line_number_offset as u64)
++        quirks_mode.into(), line_number_offset as u64,
++        Some(PerDocumentStyleData::from_ffi(raw_data).borrow().registered_property_set.clone()))
++        )
+     ).into_strong()
+ }
+ 
+ #[no_mangle]
+ pub extern "C" fn Servo_StyleSet_AppendStyleSheet(
+     raw_data: RawServoStyleSetBorrowed,
+     sheet: *const ServoStyleSheet,
+ ) {
+@@ -1002,34 +1008,37 @@ pub extern "C" fn Servo_CssRules_InsertR
+     rules: ServoCssRulesBorrowed,
+     contents: RawServoStyleSheetContentsBorrowed,
+     rule: *const nsACString,
+     index: u32,
+     nested: bool,
+     loader: *mut Loader,
+     gecko_stylesheet: *mut ServoStyleSheet,
+     rule_type: *mut u16,
++    raw_data: RawServoStyleSetBorrowed,
+ ) -> nsresult {
+     let loader = if loader.is_null() {
+         None
+     } else {
+         Some(StylesheetLoader::new(loader, gecko_stylesheet, ptr::null_mut()))
+     };
+     let loader = loader.as_ref().map(|loader| loader as &StyleStylesheetLoader);
+     let rule = unsafe { rule.as_ref().unwrap().as_str_unchecked() };
+ 
+     let global_style_data = &*GLOBAL_STYLE_DATA;
+     let contents = StylesheetContents::as_arc(&contents);
++    let data = PerDocumentStyleData::from_ffi(raw_data).borrow_mut();
+     let result = Locked::<CssRules>::as_arc(&rules).insert_rule(
+         &global_style_data.shared_lock,
+         rule,
+         contents,
+         index as usize,
+         nested,
+-        loader
++        loader,
++        data.registered_property_set.clone()
+     );
+ 
+     match result {
+         Ok(new_rule) => {
+             *unsafe { rule_type.as_mut().unwrap() } = new_rule.rule_type() as u16;
+             nsresult::NS_OK
+         }
+         Err(err) => err.into(),
+@@ -1394,22 +1403,25 @@ pub extern "C" fn Servo_KeyframesRule_Fi
+         .find_rule(&guard, key).map(|index| index as u32)
+         .unwrap_or(u32::max_value())
+ }
+ 
+ #[no_mangle]
+ pub extern "C" fn Servo_KeyframesRule_AppendRule(
+     rule: RawServoKeyframesRuleBorrowed,
+     contents: RawServoStyleSheetContentsBorrowed,
+-    css: *const nsACString
++    css: *const nsACString,
++    raw_data: RawServoStyleSetBorrowed
+ ) -> bool {
++    let data = PerDocumentStyleData::from_ffi(raw_data).borrow_mut();
+     let css = unsafe { css.as_ref().unwrap().as_str_unchecked() };
+     let contents = StylesheetContents::as_arc(&contents);
+     let global_style_data = &*GLOBAL_STYLE_DATA;
+-    match Keyframe::parse(css, &contents, &global_style_data.shared_lock) {
++    match Keyframe::parse(css, &contents, &global_style_data.shared_lock,
++                          data.registered_property_set.clone()) {
+         Ok(keyframe) => {
+             write_locked_arc(rule, |rule: &mut KeyframesRule| {
+                 rule.keyframes.push(keyframe);
+             });
+             true
+         }
+         Err(..) => false,
+     }
+@@ -1790,26 +1802,28 @@ fn parse_property_into(declarations: &mu
+         parsing_mode,
+         quirks_mode)
+ }
+ 
+ #[no_mangle]
+ pub extern "C" fn Servo_ParseProperty(property: nsCSSPropertyID, value: *const nsACString,
+                                       data: *mut URLExtraData,
+                                       parsing_mode: structs::ParsingMode,
+-                                      quirks_mode: nsCompatibility)
++                                      quirks_mode: nsCompatibility,
++                                      raw_data: RawServoStyleSetBorrowed))
+                                       -> RawServoDeclarationBlockStrong {
+     let id = get_property_id_from_nscsspropertyid!(property,
+                                                    RawServoDeclarationBlockStrong::null());
+     let mut declarations = SourcePropertyDeclaration::new();
+     match parse_property_into(&mut declarations, id, value, data,
+                               parsing_mode, quirks_mode.into()) {
+         Ok(()) => {
+             let global_style_data = &*GLOBAL_STYLE_DATA;
+-            let mut block = PropertyDeclarationBlock::new();
++            let data = PerDocumentStyleData::from_ffi(raw_data).borrow();
++            let mut block = PropertyDeclarationBlock::new(Some(data.registered_property_set.clone()));
+             block.extend(declarations.drain(), Importance::Normal);
+             Arc::new(global_style_data.shared_lock.wrap(block)).into_strong()
+         }
+         Err(_) => RawServoDeclarationBlockStrong::null()
+     }
+ }
+ 
+ #[no_mangle]
+@@ -1821,17 +1835,18 @@ pub extern "C" fn Servo_ParseEasing(easi
+ 
+     let url_data = unsafe { RefPtr::from_ptr_ref(&data) };
+     let reporter = RustLogReporter;
+     let context = ParserContext::new(Origin::Author,
+                                      url_data,
+                                      &reporter,
+                                      Some(CssRuleType::Style),
+                                      PARSING_MODE_DEFAULT,
+-                                     QuirksMode::NoQuirks);
++                                     QuirksMode::NoQuirks,
++                                     /* registeredPropertySet */ None);
+     let easing = unsafe { (*easing).to_string() };
+     let mut input = ParserInput::new(&easing);
+     let mut parser = Parser::new(&mut input);
+     let result = transition_timing_function::single_value::parse(&context, &mut parser);
+     match result {
+         Ok(parsed_easing) => {
+             *output = parsed_easing.into();
+             true
+@@ -1892,29 +1907,37 @@ pub extern "C" fn Servo_MatrixTransform_
+     if let Ok(result) =  result {
+         *output = result.into();
+     };
+ }
+ 
+ #[no_mangle]
+ pub extern "C" fn Servo_ParseStyleAttribute(data: *const nsACString,
+                                             raw_extra_data: *mut URLExtraData,
+-                                            quirks_mode: nsCompatibility)
++                                            quirks_mode: nsCompatibility,
++                                            raw_data: RawServoStyleSetBorrowed)
+                                             -> RawServoDeclarationBlockStrong {
+     let global_style_data = &*GLOBAL_STYLE_DATA;
++    let per_doc_data = PerDocumentStyleData::from_ffi(raw_data).borrow();
+     let value = unsafe { data.as_ref().unwrap().as_str_unchecked() };
+     let url_data = unsafe { RefPtr::from_ptr_ref(&raw_extra_data) };
+     Arc::new(global_style_data.shared_lock.wrap(
+-        GeckoElement::parse_style_attribute(value, url_data, quirks_mode.into()))).into_strong()
++        GeckoElement::parse_style_attribute(value, url_data, quirks_mode.into(),
++                                            per_doc_data.registered_property_set.clone()))
++                    .into_strong()
+ }
+ 
+ #[no_mangle]
+-pub extern "C" fn Servo_DeclarationBlock_CreateEmpty() -> RawServoDeclarationBlockStrong {
++pub extern "C" fn Servo_DeclarationBlock_CreateEmpty(raw_data: RawServoStyleSetBorrowed)
++                                                     -> RawServoDeclarationBlockStrong {
+     let global_style_data = &*GLOBAL_STYLE_DATA;
+-    Arc::new(global_style_data.shared_lock.wrap(PropertyDeclarationBlock::new())).into_strong()
++    let per_doc_data = PerDocumentStyleData::from_ffi(raw_data).borrow();
++    Arc::new(global_style_data.shared_lock
++                              .wrap(PropertyDeclarationBlock::new(Some(per_doc_data.registered_property_set.clone())))
++                              .into_strong()
+ }
+ 
+ #[no_mangle]
+ pub extern "C" fn Servo_DeclarationBlock_Clone(declarations: RawServoDeclarationBlockBorrowed)
+                                                -> RawServoDeclarationBlockStrong {
+     let global_style_data = &*GLOBAL_STYLE_DATA;
+     let guard = global_style_data.shared_lock.read();
+     let declarations = Locked::<PropertyDeclarationBlock>::as_arc(&declarations);
+@@ -2140,17 +2163,18 @@ pub extern "C" fn Servo_MediaList_GetTex
+ pub extern "C" fn Servo_MediaList_SetText(list: RawServoMediaListBorrowed, text: *const nsACString) {
+     let text = unsafe { text.as_ref().unwrap().as_str_unchecked() };
+     let mut input = ParserInput::new(&text);
+     let mut parser = Parser::new(&mut input);
+     let url_data = unsafe { dummy_url_data() };
+     let reporter = RustLogReporter;
+     let context = ParserContext::new_for_cssom(url_data, &reporter, Some(CssRuleType::Media),
+                                                PARSING_MODE_DEFAULT,
+-                                               QuirksMode::NoQuirks);
++                                               QuirksMode::NoQuirks,
++                                               /* registeredPropertySet */ None);
+      write_locked_arc(list, |list: &mut MediaList| {
+         *list = parse_media_query_list(&context, &mut parser);
+     })
+ }
+ 
+ #[no_mangle]
+ pub extern "C" fn Servo_MediaList_GetLength(list: RawServoMediaListBorrowed) -> u32 {
+     read_locked_arc(list, |list: &MediaList| list.media_queries.len() as u32)
+@@ -2172,31 +2196,33 @@ pub extern "C" fn Servo_MediaList_GetMed
+ #[no_mangle]
+ pub extern "C" fn Servo_MediaList_AppendMedium(list: RawServoMediaListBorrowed,
+                                                new_medium: *const nsACString) {
+     let new_medium = unsafe { new_medium.as_ref().unwrap().as_str_unchecked() };
+     let url_data = unsafe { dummy_url_data() };
+     let reporter = RustLogReporter;
+     let context = ParserContext::new_for_cssom(url_data, &reporter, Some(CssRuleType::Media),
+                                                PARSING_MODE_DEFAULT,
+-                                               QuirksMode::NoQuirks);
++                                               QuirksMode::NoQuirks,
++                                               /* registeredPropertySet */ None);
+     write_locked_arc(list, |list: &mut MediaList| {
+         list.append_medium(&context, new_medium);
+     })
+ }
+ 
+ #[no_mangle]
+ pub extern "C" fn Servo_MediaList_DeleteMedium(list: RawServoMediaListBorrowed,
+                                                old_medium: *const nsACString) -> bool {
+     let old_medium = unsafe { old_medium.as_ref().unwrap().as_str_unchecked() };
+     let url_data = unsafe { dummy_url_data() };
+     let reporter = RustLogReporter;
+     let context = ParserContext::new_for_cssom(url_data, &reporter, Some(CssRuleType::Media),
+                                                PARSING_MODE_DEFAULT,
+-                                               QuirksMode::NoQuirks);
++                                               QuirksMode::NoQuirks,
++                                               /* registeredPropertySet */ None);
+     write_locked_arc(list, |list: &mut MediaList| list.delete_medium(&context, old_medium))
+ }
+ 
+ macro_rules! get_longhand_from_id {
+     ($id:expr) => {
+         match PropertyId::from_nscsspropertyid($id) {
+             Ok(PropertyId::Longhand(long)) => long,
+             _ => {
+@@ -2552,17 +2578,18 @@ pub extern "C" fn Servo_DeclarationBlock
+     use style::values::generics::image::Image;
+     use style::values::specified::url::SpecifiedUrl;
+ 
+     let url_data = unsafe { RefPtr::from_ptr_ref(&raw_extra_data) };
+     let string = unsafe { (*value).to_string() };
+     let error_reporter = RustLogReporter;
+     let context = ParserContext::new(Origin::Author, url_data, &error_reporter,
+                                      Some(CssRuleType::Style), PARSING_MODE_DEFAULT,
+-                                     QuirksMode::NoQuirks);
++                                     QuirksMode::NoQuirks,
++                                     /* registeredPropertySet */ None);
+     if let Ok(mut url) = SpecifiedUrl::parse_from_string(string.into(), &context) {
+         url.build_image_value();
+         let decl = PropertyDeclaration::BackgroundImage(BackgroundImage(
+             vec![Either::Second(Image::Url(url))]
+         ));
+         write_locked_arc(declarations, |decls: &mut PropertyDeclarationBlock| {
+             decls.push(decl, Importance::Normal);
+         })
+@@ -2603,19 +2630,23 @@ pub extern "C" fn Servo_CSSSupports2(pro
+ pub extern "C" fn Servo_CSSSupports(cond: *const nsACString) -> bool {
+     let condition = unsafe { cond.as_ref().unwrap().as_str_unchecked() };
+     let mut input = ParserInput::new(&condition);
+     let mut input = Parser::new(&mut input);
+     let cond = input.parse_entirely(|i| parse_condition_or_declaration(i));
+     if let Ok(cond) = cond {
+         let url_data = unsafe { dummy_url_data() };
+         let reporter = RustLogReporter;
++        // We don't care about the set of registered custom properties here,
++        // according to the spec.
++        // https://drafts.css-houdini.org/css-properties-values-api-1/#conditional-rules
+         let context = ParserContext::new_for_cssom(url_data, &reporter, Some(CssRuleType::Style),
+                                                    PARSING_MODE_DEFAULT,
+-                                                   QuirksMode::NoQuirks);
++                                                   QuirksMode::NoQuirks,
++                                                   /* registeredPropertySet*/ None);
+         cond.eval(&context)
+     } else {
+         false
+     }
+ }
+ 
+ /// Only safe to call on the main thread, with exclusive access to the element and
+ /// its ancestors.
+diff -r f1007237a8b4 components/style/encoding_support.rs
+--- a/components/style/encoding_support.rs	Mon Jul 10 11:33:04 2017 -0700
++++ b/components/style/encoding_support.rs	Tue Jul 11 20:25:08 2017 -0700
+@@ -5,16 +5,18 @@
+ //! Parsing stylesheets from bytes (not `&str`).
+ 
+ extern crate encoding;
+ 
+ use context::QuirksMode;
+ use cssparser::{stylesheet_encoding, EncodingSupport};
+ use error_reporting::ParseErrorReporter;
+ use media_queries::MediaList;
++use parking_lot::RwLock;
++use properties_and_values::RegisteredPropertySet;
+ use self::encoding::{EncodingRef, DecoderTrap};
+ use shared_lock::SharedRwLock;
+ use std::str;
+ use stylearc::Arc;
+ use stylesheets::{Stylesheet, StylesheetLoader, Origin, UrlExtraData};
+ 
+ struct RustEncoding;
+ 
+@@ -53,42 +55,46 @@ impl Stylesheet {
+                       url_data: UrlExtraData,
+                       protocol_encoding_label: Option<&str>,
+                       environment_encoding: Option<EncodingRef>,
+                       origin: Origin,
+                       media: MediaList,
+                       shared_lock: SharedRwLock,
+                       stylesheet_loader: Option<&StylesheetLoader>,
+                       error_reporter: &ParseErrorReporter,
+-                      quirks_mode: QuirksMode)
++                      quirks_mode: QuirksMode,
++                      registered_property_set: Option<Arc<RwLock<RegisteredPropertySet>>>)
+                       -> Stylesheet {
+         let (string, _) = decode_stylesheet_bytes(
+             bytes, protocol_encoding_label, environment_encoding);
+         Stylesheet::from_str(&string,
+                              url_data,
+                              origin,
+                              Arc::new(shared_lock.wrap(media)),
+                              shared_lock,
+                              stylesheet_loader,
+                              error_reporter,
+                              quirks_mode,
+-                             0u64)
++                             0u64,
++                             registered_property_set)
+     }
+ 
+     /// Updates an empty stylesheet with a set of bytes that reached over the
+     /// network.
+     pub fn update_from_bytes(existing: &Stylesheet,
+                              bytes: &[u8],
+                              protocol_encoding_label: Option<&str>,
+                              environment_encoding: Option<EncodingRef>,
+                              url_data: UrlExtraData,
+                              stylesheet_loader: Option<&StylesheetLoader>,
+-                             error_reporter: &ParseErrorReporter) {
++                             error_reporter: &ParseErrorReporter,
++                             registered_property_set: Option<Arc<RwLock<RegisteredPropertySet>>>) {
+         let (string, _) = decode_stylesheet_bytes(
+             bytes, protocol_encoding_label, environment_encoding);
+         Self::update_from_str(existing,
+                               &string,
+                               url_data,
+                               stylesheet_loader,
+                               error_reporter,
+-                              0)
++                              0,
++                              registered_property_set)
+     }
+ }
+diff -r f1007237a8b4 components/style/gecko/wrapper.rs
+--- a/components/style/gecko/wrapper.rs	Mon Jul 10 11:33:04 2017 -0700
++++ b/components/style/gecko/wrapper.rs	Tue Jul 11 20:25:08 2017 -0700
+@@ -67,16 +67,17 @@ use gecko_bindings::structs::nsIDocument
+ use gecko_bindings::sugar::ownership::{HasArcFFI, HasSimpleFFI};
+ use logical_geometry::WritingMode;
+ use media_queries::Device;
+ use properties::{ComputedValues, parse_style_attribute};
+ use properties::{Importance, PropertyDeclaration, PropertyDeclarationBlock};
+ use properties::animated_properties::{AnimatableLonghand, AnimationValue, AnimationValueMap};
+ use properties::animated_properties::TransitionProperty;
+ use properties::style_structs::Font;
++use properties_and_values::RegisteredPropertySet;
+ use rule_tree::CascadeLevel as ServoCascadeLevel;
+ use selector_parser::{AttrValue, ElementExt, PseudoClassStringArg};
+ use selectors::Element;
+ use selectors::attr::{AttrSelectorOperation, AttrSelectorOperator, CaseSensitivity, NamespaceConstraint};
+ use selectors::matching::{ElementSelectorFlags, LocalMatchingContext, MatchingContext};
+ use selectors::matching::{RelevantLinkStatus, VisitedHandlingMode};
+ use selectors::sink::Push;
+ use shared_lock::Locked;
+@@ -473,18 +474,21 @@ impl<'le> fmt::Debug for GeckoElement<'l
+         write!(f, "> ({:#x})", self.as_node().opaque().0)
+     }
+ }
+ 
+ impl<'le> GeckoElement<'le> {
+     /// Parse the style attribute of an element.
+     pub fn parse_style_attribute(value: &str,
+                                  url_data: &UrlExtraData,
+-                                 quirks_mode: QuirksMode) -> PropertyDeclarationBlock {
+-        parse_style_attribute(value, url_data, &create_error_reporter(), quirks_mode)
++                                 quirks_mode: QuirksMode,
++                                 registered_property_set: Arc<RwLock<RegisteredPropertySet>>)
++                                 -> PropertyDeclarationBlock {
++        parse_style_attribute(value, url_data, &create_error_reporter(),
++                              quirks_mode, regitered_property_set)
+     }
+ 
+     fn flags(&self) -> u32 {
+         self.raw_node()._base._base_1.mFlags
+     }
+ 
+     fn raw_node(&self) -> &RawGeckoNode {
+         &(self.0)._base._base._base
+diff -r f1007237a8b4 components/style/lib.rs
+--- a/components/style/lib.rs	Mon Jul 10 11:33:04 2017 -0700
++++ b/components/style/lib.rs	Tue Jul 11 20:25:08 2017 -0700
+@@ -112,16 +112,17 @@ pub mod font_metrics;
+ #[cfg(feature = "gecko")] #[allow(unsafe_code)] pub mod gecko_bindings;
+ pub mod invalidation;
+ #[allow(missing_docs)] // TODO.
+ pub mod logical_geometry;
+ pub mod matching;
+ pub mod media_queries;
+ pub mod parallel;
+ pub mod parser;
++pub mod properties_and_values;
+ pub mod rule_tree;
+ pub mod scoped_tls;
+ pub mod selector_map;
+ pub mod selector_parser;
+ pub mod shared_lock;
+ pub mod sharing;
+ pub mod stylist;
+ #[cfg(feature = "servo")] #[allow(unsafe_code)] pub mod servo;
+diff -r f1007237a8b4 components/style/parser.rs
+--- a/components/style/parser.rs	Mon Jul 10 11:33:04 2017 -0700
++++ b/components/style/parser.rs	Tue Jul 11 20:25:08 2017 -0700
+@@ -2,19 +2,22 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ //! The context within which CSS code is parsed.
+ 
+ use context::QuirksMode;
+ use cssparser::{Parser, SourcePosition, UnicodeRange};
+ use error_reporting::{ParseErrorReporter, ContextualParseError};
++use parking_lot::RwLock;
++use properties_and_values::RegisteredPropertySet;
+ use style_traits::{OneOrMoreSeparated, ParseError, ParsingMode, Separator};
+ #[cfg(feature = "gecko")]
+ use style_traits::{PARSING_MODE_DEFAULT, PARSING_MODE_ALLOW_UNITLESS_LENGTH, PARSING_MODE_ALLOW_ALL_NUMERIC_VALUES};
++use stylearc::Arc;
+ use stylesheets::{CssRuleType, Origin, UrlExtraData, Namespaces};
+ 
+ /// Asserts that all ParsingMode flags have a matching ParsingMode value in gecko.
+ #[cfg(feature = "gecko")]
+ #[inline]
+ pub fn assert_parsing_mode_match() {
+     use gecko_bindings::structs;
+ 
+@@ -52,85 +55,97 @@ pub struct ParserContext<'a> {
+     /// Line number offsets for inline stylesheets
+     pub line_number_offset: u64,
+     /// The mode to use when parsing.
+     pub parsing_mode: ParsingMode,
+     /// The quirks mode of this stylesheet.
+     pub quirks_mode: QuirksMode,
+     /// The currently active namespaces.
+     pub namespaces: Option<&'a Namespaces>,
++    /// The set of registered custom properties.
++    pub registered_property_set: Option<Arc<RwLock<RegisteredPropertySet>>>,
+ }
+ 
+ impl<'a> ParserContext<'a> {
+     /// Create a parser context.
++    ///
++    /// `registered_property_set` should be null only when we do not expect to
++    /// parse any coustom properties.
+     pub fn new(stylesheet_origin: Origin,
+                url_data: &'a UrlExtraData,
+                error_reporter: &'a ParseErrorReporter,
+                rule_type: Option<CssRuleType>,
+                parsing_mode: ParsingMode,
+-               quirks_mode: QuirksMode)
++               quirks_mode: QuirksMode,
++               registered_property_set: Option<Arc<RwLock<RegisteredPropertySet>>>)
+                -> ParserContext<'a> {
+         ParserContext {
+             stylesheet_origin: stylesheet_origin,
+             url_data: url_data,
+             error_reporter: error_reporter,
+             rule_type: rule_type,
+             line_number_offset: 0u64,
+             parsing_mode: parsing_mode,
+             quirks_mode: quirks_mode,
+             namespaces: None,
++            registered_property_set: registered_property_set,
+         }
+     }
+ 
+     /// Create a parser context for on-the-fly parsing in CSSOM
+     pub fn new_for_cssom(
+         url_data: &'a UrlExtraData,
+         error_reporter: &'a ParseErrorReporter,
+         rule_type: Option<CssRuleType>,
+         parsing_mode: ParsingMode,
+-        quirks_mode: QuirksMode
++        quirks_mode: QuirksMode,
++        registered_property_set: Option<Arc<RwLock<RegisteredPropertySet>>>
+     ) -> ParserContext<'a> {
+-        Self::new(Origin::Author, url_data, error_reporter, rule_type, parsing_mode, quirks_mode)
++        Self::new(Origin::Author, url_data, error_reporter, rule_type,
++                  parsing_mode, quirks_mode, registered_property_set)
+     }
+ 
+     /// Create a parser context based on a previous context, but with a modified rule type.
+     pub fn new_with_rule_type(
+         context: &'a ParserContext,
+         rule_type: Option<CssRuleType>
+     ) -> ParserContext<'a> {
+         ParserContext {
+             stylesheet_origin: context.stylesheet_origin,
+             url_data: context.url_data,
+             error_reporter: context.error_reporter,
+             rule_type: rule_type,
+             line_number_offset: context.line_number_offset,
+             parsing_mode: context.parsing_mode,
+             quirks_mode: context.quirks_mode,
+             namespaces: context.namespaces,
++            registered_property_set: context.registered_property_set.clone(),
+         }
+     }
+ 
+     /// Create a parser context for inline CSS which accepts additional line offset argument.
+     pub fn new_with_line_number_offset(
+         stylesheet_origin: Origin,
+         url_data: &'a UrlExtraData,
+         error_reporter: &'a ParseErrorReporter,
+         line_number_offset: u64,
+         parsing_mode: ParsingMode,
+-        quirks_mode: QuirksMode
++        quirks_mode: QuirksMode,
++        registered_property_set: Option<Arc<RwLock<RegisteredPropertySet>>>
+     ) -> ParserContext<'a> {
+         ParserContext {
+             stylesheet_origin: stylesheet_origin,
+             url_data: url_data,
+             error_reporter: error_reporter,
+             rule_type: None,
+             line_number_offset: line_number_offset,
+             parsing_mode: parsing_mode,
+             quirks_mode: quirks_mode,
+             namespaces: None,
++            registered_property_set: registered_property_set,
+         }
+     }
+ 
+     /// Get the rule type, which assumes that one is available.
+     pub fn rule_type(&self) -> CssRuleType {
+         self.rule_type.expect("Rule type expected, but none was found.")
+     }
+ }
+diff -r f1007237a8b4 components/style/properties/declaration_block.rs
+--- a/components/style/properties/declaration_block.rs	Mon Jul 10 11:33:04 2017 -0700
++++ b/components/style/properties/declaration_block.rs	Tue Jul 11 20:25:08 2017 -0700
+@@ -1,28 +1,36 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ //! A property declaration block.
+ 
++#![allow(dead_code)]
+ #![deny(missing_docs)]
+ 
+ use context::QuirksMode;
+ use cssparser::{DeclarationListParser, parse_important, ParserInput, CompactCowStr};
+ use cssparser::{Parser, AtRuleParser, DeclarationParser, Delimiter};
+ use error_reporting::{ParseErrorReporter, ContextualParseError};
++use parking_lot::RwLock;
+ use parser::{ParserContext, log_css_error};
+ use properties::animated_properties::AnimationValue;
++use properties_and_values::RegisteredPropertySet;
+ use selectors::parser::SelectorParseError;
+ use shared_lock::Locked;
+ use smallvec::SmallVec;
+ use std::fmt;
++use std::collections::HashMap;
++use std::iter::Enumerate;
+ use std::slice::Iter;
++use error_reporting::NullReporter;
++use properties::DeclaredValueOwned;
+ use style_traits::{PARSING_MODE_DEFAULT, ToCss, ParseError, ParsingMode, StyleParseError};
++use stylearc::Arc;
+ use stylesheets::{CssRuleType, Origin, UrlExtraData};
+ use stylesheets::{MallocSizeOf, MallocSizeOfFn};
+ use super::*;
+ use values::computed::Context;
+ #[cfg(feature = "gecko")] use properties::animated_properties::AnimationValueMap;
+ 
+ /// The animation rules.
+ ///
+@@ -62,28 +70,134 @@ impl Importance {
+     pub fn important(self) -> bool {
+         match self {
+             Importance::Normal => false,
+             Importance::Important => true,
+         }
+     }
+ }
+ 
++#[derive(Clone)]
++struct RegisteredPropertyItem {
++    /// The ID of the declaration actually used.
++    used_declaration: Option<usize>,
++    /// The variable name (used to read its registration from the registered
++    /// property set).
++    name: ::custom_properties::Name,
++    /// The specified value for this property, when we are able to parse it.
++    parsed_value: Option<::properties_and_values::SpecifiedValue>,
++}
++
++#[derive(Clone)]
++struct RegisteredPropertyData {
++    /// registered_property_set.generation() at the last time we recomputed all
++    /// the valid declarations
++    total_generation: u32,
++
++    /// variable name (without --) → variable ID
++    ids: HashMap<::custom_properties::Name, usize>,
++
++    /// variable ID → data regarding this variable
++    items: Vec<RegisteredPropertyItem>,
++}
++
++struct PropertyDeclarationBlockIteratorData<'a> {
++    pdb: &'a PropertyDeclarationBlock,
++    iter: Enumerate<Iter<'a, (PropertyDeclaration, Importance)>>,
++}
++
++/// An iterator over declarations and their importances.
++pub struct PropertyDeclarationBlockIterator<'a> {
++    data: Option<PropertyDeclarationBlockIteratorData<'a>>,
++}
++
++impl<'a> PropertyDeclarationBlockIterator<'a> {
++    /// Create a PropertyDeclarationBlockIterator from a
++    /// PropertyDeclarationBlock.
++    pub fn new(pdb: &'a PropertyDeclarationBlock) -> Self {
++        PropertyDeclarationBlockIterator {
++            data: Some(PropertyDeclarationBlockIteratorData {
++                pdb: pdb,
++                iter: pdb.declarations.iter().enumerate(),
++            }),
++        }
++    }
++
++    /// Create an empty PropertyDeclarationBlockIterator.
++    pub fn empty() -> Self {
++        PropertyDeclarationBlockIterator {
++            data: None,
++        }
++    }
++}
++
++impl<'a> Iterator for PropertyDeclarationBlockIterator<'a> {
++    type Item = &'a (PropertyDeclaration, Importance);
++
++    // Seems we can't just use filter because that requires a closure (can't
++    // partially apply a method). Using this struct keeps everything sized.
++    fn next(&mut self) -> Option<Self::Item> {
++        let mut data = match self.data {
++            None => return None,
++            Some(ref mut data) => data
++        };
++
++        loop {
++            match data.iter.next() {
++                None => return None,
++                Some(x) => {
++                    if data.pdb.is_used_declaration(x) {
++                        return Some(x.1)
++                    }
++                }
++            }
++        }
++    }
++}
++
++impl<'a> DoubleEndedIterator for PropertyDeclarationBlockIterator<'a> {
++    fn next_back(&mut self) -> Option<Self::Item> {
++        let mut data = match self.data {
++            None => return None,
++            Some(ref mut data) => data
++        };
++
++        loop {
++            match data.iter.next_back() {
++                None => return None,
++                Some(x) => {
++                    if data.pdb.is_used_declaration(x) {
++                        return Some(x.1)
++                    }
++                }
++            }
++        }
++    }
++}
++
+ /// Overridden declarations are skipped.
+ #[derive(Clone)]
+ pub struct PropertyDeclarationBlock {
+-    /// The group of declarations, along with their importance.
+-    ///
+-    /// Only deduplicated declarations appear here.
++    /// declaration id → declaration
+     declarations: Vec<(PropertyDeclaration, Importance)>,
+ 
+-    /// The number of entries in `self.declaration` with `Importance::Important`
++    /// The number of used entries in `self.declaration` with
++    /// `Importance::Important`
+     important_count: usize,
+ 
++    /// The longhand properties for which we have declarations.
+     longhands: LonghandIdSet,
++
++    /// The set of registered custom properties to use when deciding which
++    /// custom property declaration is valid, as well as the data computed
++    /// regarding declarations of registered properties if there are any.
++    /// The behavior if this is None and if the registered property set is empty
++    /// are identical.
++    registered_property_data: Option<(Arc<RwLock<RegisteredPropertySet>>,
++                                      Option<Box<RegisteredPropertyData>>)>,
+ }
+ 
+ impl MallocSizeOf for PropertyDeclarationBlock {
+     fn malloc_size_of_children(&self, malloc_size_of: MallocSizeOfFn) -> usize {
+         self.declarations.malloc_size_of_children(malloc_size_of)
+     }
+ }
+ 
+@@ -103,27 +217,27 @@ impl<'a> Iterator for PropertyDeclaratio
+             &dec.0
+         }
+         self.iter.next().map(get_declaration as fn(_) -> _)
+     }
+ }
+ 
+ /// Iterator for AnimationValue to be generated from PropertyDeclarationBlock.
+ pub struct AnimationValueIterator<'a, 'cx, 'cx_a:'cx> {
+-    iter: Iter<'a, (PropertyDeclaration, Importance)>,
++    iter: PropertyDeclarationBlockIterator<'a>,
+     context: &'cx mut Context<'cx_a>,
+     default_values: &'a Arc<ComputedValues>,
+ }
+ 
+ impl<'a, 'cx, 'cx_a:'cx> AnimationValueIterator<'a, 'cx, 'cx_a> {
+     fn new(declarations: &'a PropertyDeclarationBlock,
+            context: &'cx mut Context<'cx_a>,
+            default_values: &'a Arc<ComputedValues>) -> AnimationValueIterator<'a, 'cx, 'cx_a> {
+         AnimationValueIterator {
+-            iter: declarations.declarations().iter(),
++            iter: declarations.declarations(),
+             context: context,
+             default_values: default_values,
+         }
+     }
+ }
+ 
+ impl<'a, 'cx, 'cx_a:'cx> Iterator for AnimationValueIterator<'a, 'cx, 'cx_a> {
+     type Item = (AnimatableLonghand, AnimationValue);
+@@ -156,95 +270,289 @@ impl<'a, 'cx, 'cx_a:'cx> Iterator for An
+ }
+ 
+ impl fmt::Debug for PropertyDeclarationBlock {
+     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+         self.declarations.fmt(f)
+     }
+ }
+ 
++macro_rules! assert_fresh_validities {
++    ($self:expr) => {
++        if cfg!(debug_assertions) {
++            $self.assert_fresh_validities();
++        }
++    }
++}
++
+ impl PropertyDeclarationBlock {
++    /// Assert that either `total_generation` matches the current generation, or
++    /// all `generations` match the current generation.
++    /// We don't want every caller of an accessor to have to acquire a write
++    /// lock to lazily update which declarations are valid if needed; instead we
++    /// require that someone at some point previously with a write lock should
++    /// have called `recompute_validities`.
++    /// This is called by the `assert_fresh_validities!` macro, which only calls
++    /// this function in debug mode.
++    #[cfg(debug_assertions)]
++    fn assert_fresh_validities(&self) {
++        match self.registered_property_data {
++            Some((ref lock, Some(ref data))) => {
++                let set = lock.read();
++                if data.total_generation == set.generation() {
++                    return
++                }
++                panic!("Stale validities in an accessor--someone should have \
++                        called recompute_validities.");
++            },
++            _ => ()
++        }
++    }
++
+     /// Returns the number of declarations in the block.
+     pub fn len(&self) -> usize {
++        assert_fresh_validities!(self);
+         self.declarations.len()
+     }
+ 
+-    /// Create an empty block
+-    pub fn new() -> Self {
++    /// Create an empty block.
++    ///
++    /// `registered_property_set` will be used to determine which custom
++    /// property declarations are valid. This argument should be supplied in all
++    /// cases except for UA stylesheets, which should not currently use
++    /// variables (or if you are absolutely sure no custom properties registered
++    /// with the Properties & Values API will be encountered, say in a
++    /// testcase.).
++    pub fn new(registered_property_set: Option<Arc<RwLock<RegisteredPropertySet>>>) -> Self {
+         PropertyDeclarationBlock {
+             declarations: Vec::new(),
++
+             important_count: 0,
+             longhands: LonghandIdSet::new(),
++
++            registered_property_data: registered_property_set.map(|x| (x, None)),
+         }
+     }
+ 
+-    /// Create a block with a single declaration
++    /// Create a block with a single declaration.
++    ///
++    /// Note that if this is used with a custom property, we will assume that it
++    /// is considered valid with the custom property registrations that are in
++    /// effect.
+     pub fn with_one(declaration: PropertyDeclaration, importance: Importance) -> Self {
+         let mut longhands = LonghandIdSet::new();
+         if let PropertyDeclarationId::Longhand(id) = declaration.id() {
+             longhands.insert(id);
+         }
+         PropertyDeclarationBlock {
+             declarations: vec![(declaration, importance)],
++
+             important_count: if importance.important() { 1 } else { 0 },
+             longhands: longhands,
++            registered_property_data: None,
++        }
++    }
++
++    fn is_used_declaration(&self, x: (usize, &(PropertyDeclaration, Importance))) -> bool {
++        assert_fresh_validities!(self);
++        let (decl_id, &(ref declaration, _)) = x;
++        match *declaration {
++            PropertyDeclaration::Custom(ref name, _) => {
++                // Probably want to make this faster?
++                let data = match self.registered_property_data {
++                    Some((_, Some(ref data))) => data,
++                    _ => return true,
++                };
++                let var_id = *data.ids.get(name).unwrap();
++
++                Some(decl_id) == data.items[var_id].used_declaration
++            },
++            _ => true
+         }
+     }
+ 
+     /// The declarations in this block
+-    pub fn declarations(&self) -> &[(PropertyDeclaration, Importance)] {
+-        &self.declarations
++    pub fn declarations(&self) -> PropertyDeclarationBlockIterator {
++        assert_fresh_validities!(self);
++        PropertyDeclarationBlockIterator::new(self)
+     }
+ 
+     /// Iterate over only PropertyDeclaration.
+     pub fn declarations_iter(&self) -> PropertyDeclarationIterator {
++        assert_fresh_validities!(self);
+         PropertyDeclarationIterator {
+             iter: self.declarations.iter(),
+         }
+     }
+ 
++    fn compute_validity(registered_property_set: &RegisteredPropertySet,
++                        name: &::custom_properties::Name,
++                        declaration: &PropertyDeclaration,
++                        quirks_mode: QuirksMode)
++                        -> Result<Option<::properties_and_values::SpecifiedValue>, ()> {
++        // So far, we've parsed the name and the token stream value. Then if
++        // this custom property isn't registered or the value is one of the
++        // CSS-wide keywords, there's no concept of an 'illegal' value that we
++        // ignore, so the last declaration wins.
++        //
++        // NB: if the value (really an expression) contains a variable
++        // reference:
++        //   If a property contains one or more var() functions, and those
++        //   functions are syntactically valid, the entire property’s grammar
++        //   must be assumed to be valid at parse time. It is only
++        //   syntax-checked at computed-value time, after var() functions have
++        //   been substituted.
++        //   -- CSS Variables
++
++        // `result` will be `Some((registration, value))` iff we should
++        // eagerly parse this declaration.
++        let result = match *declaration {
++            PropertyDeclaration::Custom(_, DeclaredValueOwned::CSSWideKeyword(_)) => None,
++            // See the comment on PropertyDeclaration and the asserts in
++            // `custom_properties.rs`.
++            PropertyDeclaration::Custom(_, DeclaredValueOwned::Value(ref value)) => {
++                match (!value.has_references(), registered_property_set.get(name)) {
++                    (true, Some(registration)) => Some((registration, value)),
++                    _ => None
++                }
++            },
++            _ => unreachable!("compute_validity expects custom properties \
++                               only, which only use the Custom variant (and in \
++                               the field of that variant, only the \
++                               DeclaredValueOwned::CSSWideKeyword and \
++                               DeclaredValueOwned::Value variants).")
++        };
++
++        match result {
++            // Valid declaration; can't parse now.
++            None => Ok(None),
++            Some((registration, value)) => {
++                let error_reporter = NullReporter;
++                // The origin shouldn't matter because we are just parsing a
++                // declaration.
++                // We shouldn't need the registered property set because we are
++                // parsing a value, not a declartion
++                let context = ParserContext::new(Origin::Author,
++                                                 &value.url_data,
++                                                 &error_reporter,
++                                                 /* rule_type */ None,
++                                                 PARSING_MODE_DEFAULT,
++                                                 quirks_mode,
++                                                 /* registered_property_set */ None);
++                let mut input = ParserInput::new(&value.css);
++                let mut input = Parser::new(&mut input);
++                registration.syntax.parse(&context, &mut input)
++                                   .map_err(|_| ()).map(|x| Some(x))
++            }
++        }
++    }
++
++    /// Recompute which declarations are valid.
++    /// Suppose there is a registered custom property `--foo` with syntax
++    /// `<integer>` and two declarations `--foo: 5` and `--foo: bar`. Initially
++    /// we should use the first declaration; if later `CSS.registerProperty`
++    /// is called to change the syntax of `--foo` to `*` we should use the
++    /// second declaration.
++    pub fn recompute_validities(&mut self, quirks_mode: QuirksMode) {
++        // Borrow here so that later on the compiler doesn't try to borrow self
++        // for the closure and then complain.
++        let declarations = &self.declarations;
++        let (lock, mut data) = match self.registered_property_data {
++            Some((ref lock, Some(ref mut data))) => (lock, data),
++            _ => return
++        };
++        let set = lock.read();
++        if data.total_generation == set.generation() { 
++            return
++        }
++        // It's important to reset used_declaration in case *no*
++        // declarations are valid for a variable after we recompute.
++        for item in data.items.iter_mut() {
++            item.used_declaration = None
++        }
++        // Check declarations backwards so we compute validity fewer times than
++        // if we checked forwards.
++        for (decl_id, decl) in self.declarations.iter().enumerate().rev() {
++            let (ref declaration, ref importance) = *decl;
++            let name = match *declaration {
++                PropertyDeclaration::Custom(ref name, _) => name,
++                _ => continue,
++            };
++            let var_id = *data.ids.get(name).unwrap();
++            // This declaration should be strictly more important than the
++            // currently used one in order for us to consider it (we're checking
++            // backwards).
++            match (*importance, data.items[var_id].used_declaration.map(|id| declarations[id].1)) {
++                (Importance::Normal, None) | (Importance::Important, Some(Importance::Normal)) => (),
++                _ => continue,
++            }
++            match PropertyDeclarationBlock::compute_validity(&*set, name, &(*decl).0, quirks_mode) {
++                Ok(maybe_parsed) => {
++                    if let parsed @ Some(_) = maybe_parsed {
++                        data.items[var_id].parsed_value = parsed
++                    }
++                    data.items[var_id].used_declaration = Some(decl_id)
++                },
++                Err(()) => ()
++            }
++        }
++        // Update important_count.
++        self.important_count = data.items.iter().filter(|item| {
++            match item.used_declaration {
++                None => false,
++                Some(decl_id) => declarations[decl_id].1.important()
++            }
++        }).count();
++        data.total_generation = set.generation()
++    }
++
+     /// Return an iterator of (AnimatableLonghand, AnimationValue).
+     pub fn to_animation_value_iter<'a, 'cx, 'cx_a:'cx>(&'a self,
+                                                        context: &'cx mut Context<'cx_a>,
+                                                        default_values: &'a Arc<ComputedValues>)
+                                                        -> AnimationValueIterator<'a, 'cx, 'cx_a> {
++        assert_fresh_validities!(self);
+         AnimationValueIterator::new(self, context, default_values)
+     }
+ 
+     /// Returns whether this block contains any declaration with `!important`.
+     ///
+     /// This is based on the `important_count` counter,
+     /// which should be maintained whenever `declarations` is changed.
+     // FIXME: make fields private and maintain it here in methods?
+     pub fn any_important(&self) -> bool {
++        assert_fresh_validities!(self);
+         self.important_count > 0
+     }
+ 
+     /// Returns whether this block contains any declaration without `!important`.
+     ///
+     /// This is based on the `important_count` counter,
+     /// which should be maintained whenever `declarations` is changed.
+     // FIXME: make fields private and maintain it here in methods?
+     pub fn any_normal(&self) -> bool {
++        assert_fresh_validities!(self);
+         self.declarations.len() > self.important_count
+     }
+ 
+     /// Get a declaration for a given property.
+     ///
+     /// NOTE: This is linear time.
+     pub fn get(&self, property: PropertyDeclarationId) -> Option< &(PropertyDeclaration, Importance)> {
++        assert_fresh_validities!(self);
+         self.declarations.iter().find(|&&(ref decl, _)| decl.id() == property)
+     }
+ 
+     /// Find the value of the given property in this block and serialize it
+     ///
+     /// https://dev.w3.org/csswg/cssom/#dom-cssstyledeclaration-getpropertyvalue
+     pub fn property_value_to_css<W>(&self, property: &PropertyId, dest: &mut W) -> fmt::Result
+         where W: fmt::Write,
+     {
++        assert_fresh_validities!(self);
+         // Step 1.1: done when parsing a string to PropertyId
+ 
+         // Step 1.2
+         match property.as_shorthand() {
+             Ok(shorthand) => {
+                 // Step 1.2.1
+                 let mut list = Vec::new();
+                 let mut important_count = 0;
+@@ -290,16 +598,17 @@ impl PropertyDeclarationBlock {
+                     Ok(())
+                 }
+             }
+         }
+     }
+ 
+     /// https://dev.w3.org/csswg/cssom/#dom-cssstyledeclaration-getpropertypriority
+     pub fn property_priority(&self, property: &PropertyId) -> Importance {
++        assert_fresh_validities!(self);
+         // Step 1: done when parsing a string to PropertyId
+ 
+         // Step 2
+         match property.as_shorthand() {
+             Ok(shorthand) => {
+                 // Step 2.1 & 2.2 & 2.3
+                 if shorthand.longhands().iter().all(|&l| {
+                     self.get(PropertyDeclarationId::Longhand(l))
+@@ -328,16 +637,17 @@ impl PropertyDeclarationBlock {
+ 
+     /// Adds or overrides the declaration for a given property in this block,
+     /// **even** if an existing declaration for the same property is more
+     /// important, and reuses the same position in the block.
+     ///
+     /// Returns whether anything changed.
+     pub fn extend_reset(&mut self, drain: SourcePropertyDeclarationDrain,
+                         importance: Importance) -> bool {
++        assert_fresh_validities!(self);
+         self.extend_common(drain, importance, true)
+     }
+ 
+     fn extend_common(
+         &mut self,
+         mut drain: SourcePropertyDeclarationDrain,
+         importance: Importance,
+         overwrite_more_important_and_reuse_slot: bool,
+@@ -458,16 +768,17 @@ impl PropertyDeclarationBlock {
+         }
+         true
+     }
+ 
+     /// Set the declaration importance for a given property, if found.
+     ///
+     /// Returns whether any declaration was updated.
+     pub fn set_importance(&mut self, property: &PropertyId, new_importance: Importance) -> bool {
++        assert_fresh_validities!(self);
+         let mut updated_at_least_one = false;
+         for &mut (ref declaration, ref mut importance) in &mut self.declarations {
+             if declaration.id().is_or_is_longhand_of(property) {
+                 match (*importance, new_importance) {
+                     (Importance::Normal, Importance::Important) => {
+                         self.important_count += 1;
+                     }
+                     (Importance::Important, Importance::Normal) => {
+@@ -483,16 +794,17 @@ impl PropertyDeclarationBlock {
+         }
+         updated_at_least_one
+     }
+ 
+     /// https://dev.w3.org/csswg/cssom/#dom-cssstyledeclaration-removeproperty
+     ///
+     /// Returns whether any declaration was actually removed.
+     pub fn remove_property(&mut self, property: &PropertyId) -> bool {
++        assert_fresh_validities!(self);
+         if let PropertyId::Longhand(id) = *property {
+             if !self.longhands.contains(id) {
+                 return false
+             }
+         }
+         let important_count = &mut self.important_count;
+         let mut removed_at_least_one = false;
+         let longhands = &mut self.longhands;
+@@ -557,23 +869,26 @@ impl PropertyDeclarationBlock {
+           longhands.set_animatable_longhand_bit(property);
+           declarations.push((animation_value.uncompute(), Importance::Normal));
+         }
+ 
+         PropertyDeclarationBlock {
+             declarations: declarations,
+             important_count: 0,
+             longhands: longhands,
++            // The animated values for custom properties should all be valid declarations.
++            registered_property_set: None,
+         }
+     }
+ 
+     /// Returns true if the declaration block has a CSSWideKeyword for the given
+     /// property.
+     #[cfg(feature = "gecko")]
+     pub fn has_css_wide_keyword(&self, property: &PropertyId) -> bool {
++        assert_fresh_validities!(self);
+         if let PropertyId::Longhand(id) = *property {
+             if !self.longhands.contains(id) {
+                 return false
+             }
+         }
+         self.declarations.iter().any(|&(ref decl, _)|
+             decl.id().is_or_is_longhand_of(property) &&
+             decl.get_css_wide_keyword().is_some()
+@@ -581,16 +896,17 @@ impl PropertyDeclarationBlock {
+     }
+ }
+ 
+ impl ToCss for PropertyDeclarationBlock {
+     // https://drafts.csswg.org/cssom/#serialize-a-css-declaration-block
+     fn to_css<W>(&self, dest: &mut W) -> fmt::Result
+         where W: fmt::Write,
+     {
++        assert_fresh_validities!(self);
+         let mut is_first_serialization = true; // trailing serializations should have a prepended space
+ 
+         // Step 1 -> dest = result list
+ 
+         // Step 2
+         let mut already_serialized = PropertyDeclarationIdSet::new();
+ 
+         // Step 3
+@@ -872,46 +1188,53 @@ pub fn append_serialization<'a, W, I, N>
+     dest.write_char(';')
+ }
+ 
+ /// A helper to parse the style attribute of an element, in order for this to be
+ /// shared between Servo and Gecko.
+ pub fn parse_style_attribute(input: &str,
+                              url_data: &UrlExtraData,
+                              error_reporter: &ParseErrorReporter,
+-                             quirks_mode: QuirksMode)
++                             quirks_mode: QuirksMode,
++                             registered_property_set: Arc<RwLock<RegisteredPropertySet>>)
+                              -> PropertyDeclarationBlock {
+     let context = ParserContext::new(Origin::Author,
+                                      url_data,
+                                      error_reporter,
+                                      Some(CssRuleType::Style),
+                                      PARSING_MODE_DEFAULT,
+-                                     quirks_mode);
++                                     quirks_mode,
++                                     Some(registered_property_set));
+     let mut input = ParserInput::new(input);
+     parse_property_declaration_list(&context, &mut Parser::new(&mut input))
+ }
+ 
+ /// Parse a given property declaration. Can result in multiple
+ /// `PropertyDeclaration`s when expanding a shorthand, for example.
+ ///
+ /// This does not attempt to parse !important at all.
+ pub fn parse_one_declaration_into(declarations: &mut SourcePropertyDeclaration,
+                                   id: PropertyId,
+                                   input: &str,
+                                   url_data: &UrlExtraData,
+                                   error_reporter: &ParseErrorReporter,
+                                   parsing_mode: ParsingMode,
+                                   quirks_mode: QuirksMode)
+                                   -> Result<(), ()> {
++    // We shouldn't need to pass the registeredPropertySet because (1) we are
++    // just parsing a declaration and (2) we are parsing it into this
++    // declaration block, which should be the one whose registered property set
++    // we are using.
+     let context = ParserContext::new(Origin::Author,
+                                      url_data,
+                                      error_reporter,
+                                      Some(CssRuleType::Style),
+                                      parsing_mode,
+-                                     quirks_mode);
++                                     quirks_mode,
++                                     /* registeredPropertySet */ None);
+     let mut input = ParserInput::new(input);
+     Parser::new(&mut input).parse_entirely(|parser| {
+         PropertyDeclaration::parse_into(declarations, id, &context, parser)
+             .map_err(|e| e.into())
+     }).map_err(|_| ())
+ }
+ 
+ /// A struct to parse property declarations.
+@@ -930,16 +1253,25 @@ impl<'a, 'b, 'i> AtRuleParser<'i> for Pr
+ 
+ impl<'a, 'b, 'i> DeclarationParser<'i> for PropertyDeclarationParser<'a, 'b> {
+     type Declaration = Importance;
+     type Error = SelectorParseError<'i, StyleParseError<'i>>;
+ 
+     fn parse_value<'t>(&mut self, name: CompactCowStr<'i>, input: &mut Parser<'i, 't>)
+                        -> Result<Importance, ParseError<'i>> {
+         let id = PropertyId::parse(name)?;
++
++        // If we see a custom property, our ParserContext should have some
++        // RegisteredPropertySet.
++        assert!(match (&id, self.context) {
++            (&PropertyId::Custom(_), &ParserContext { registered_property_set: Some(_), .. }) => true,
++            (&PropertyId::Custom(_), _) => false,
++            _ => true,
++        });
++
+         input.parse_until_before(Delimiter::Bang, |input| {
+             PropertyDeclaration::parse_into(self.declarations, id, self.context, input)
+                 .map_err(|e| e.into())
+         })?;
+         let importance = match input.try(parse_important) {
+             Ok(()) => Importance::Important,
+             Err(_) => Importance::Normal,
+         };
+@@ -951,17 +1283,17 @@ impl<'a, 'b, 'i> DeclarationParser<'i> f
+ 
+ 
+ /// Parse a list of property declarations and return a property declaration
+ /// block.
+ pub fn parse_property_declaration_list(context: &ParserContext,
+                                        input: &mut Parser)
+                                        -> PropertyDeclarationBlock {
+     let mut declarations = SourcePropertyDeclaration::new();
+-    let mut block = PropertyDeclarationBlock::new();
++    let mut block = PropertyDeclarationBlock::new(context.registered_property_set.clone());
+     let parser = PropertyDeclarationParser {
+         context: context,
+         declarations: &mut declarations,
+     };
+     let mut iter = DeclarationListParser::new(input, parser);
+     while let Some(declaration) = iter.next() {
+         match declaration {
+             Ok(importance) => {
+diff -r f1007237a8b4 components/style/properties/properties.mako.rs
+--- a/components/style/properties/properties.mako.rs	Mon Jul 10 11:33:04 2017 -0700
++++ b/components/style/properties/properties.mako.rs	Tue Jul 11 20:25:08 2017 -0700
+@@ -419,22 +419,25 @@ impl PropertyDeclarationIdSet {
+             f(&
+                 ::custom_properties::substitute(css, first_token_type, custom_properties)
+                 .ok()
+                 .and_then(|css| {
+                     // As of this writing, only the base URL is used for property values:
+                     //
+                     // FIXME(pcwalton): Cloning the error reporter is slow! But so are custom
+                     // properties, so whatever...
++                    // Don't need to pass the registeredPropertySet because we
++                    // don't have the possibility of creating new declarations.
+                     let context = ParserContext::new(Origin::Author,
+                                                      url_data,
+                                                      error_reporter,
+                                                      None,
+                                                      PARSING_MODE_DEFAULT,
+-                                                     quirks_mode);
++                                                     quirks_mode,
++                                                     /* registeredProperytSet */ None);
+                     let mut input = ParserInput::new(&css);
+                     Parser::new(&mut input).parse_entirely(|input| {
+                         match from_shorthand {
+                             None => {
+                                 longhands::${property.ident}
+                                          ::parse_specified(&context, input).map(DeclaredValueOwned::Value)
+                             }
+                             Some(ShorthandId::All) => {
+@@ -1107,19 +1110,22 @@ pub enum PropertyDeclaration {
+             ${property.camel_case}(Box<longhands::${property.ident}::SpecifiedValue>),
+         % else:
+             ${property.camel_case}(longhands::${property.ident}::SpecifiedValue),
+         % endif
+     % endfor
+     /// A css-wide keyword.
+     CSSWideKeyword(LonghandId, CSSWideKeyword),
+     /// An unparsed value that contains `var()` functions.
++    /// Custom properties should not use this, and instead always use the Custom
++    /// variant.
+     WithVariables(LonghandId, Arc<UnparsedValue>),
+     /// A custom property declaration, with the property name and the declared
+     /// value.
++    /// The DeclaredValueOwned::WithVariables variant should not be used.
+     Custom(::custom_properties::Name, DeclaredValueOwned<Box<::custom_properties::SpecifiedValue>>),
+ }
+ 
+ impl HasViewportPercentage for PropertyDeclaration {
+     fn has_viewport_percentage(&self) -> bool {
+         match *self {
+             % for property in data.longhands:
+                 PropertyDeclaration::${property.camel_case}(ref val) => {
+@@ -2597,21 +2603,20 @@ pub fn cascade(device: &Device,
+     let iter_declarations = || {
+         rule_node.self_and_ancestors().flat_map(|node| {
+             let cascade_level = node.cascade_level();
+             let source = node.style_source();
+             let declarations = if source.is_some() {
+                 source.read(cascade_level.guard(guards)).declarations()
+             } else {
+                 // The root node has no style source.
+-                &[]
++                PropertyDeclarationBlockIterator::empty()
+             };
+             let node_importance = node.importance();
+             declarations
+-                .iter()
+                 // Yield declarations later in source order (with more precedence) first.
+                 .rev()
+                 .filter_map(move |&(ref declaration, declaration_importance)| {
+                     if declaration_importance == node_importance {
+                         Some((declaration, cascade_level))
+                     } else {
+                         None
+                     }
+@@ -2656,16 +2661,17 @@ pub fn apply_declarations<'a, F, I>(devi
+     for (declaration, _cascade_level) in iter_declarations() {
+         if let PropertyDeclaration::Custom(ref name, ref value) = *declaration {
+             ::custom_properties::cascade(
+                 &mut custom_properties, &inherited_custom_properties,
+                 &mut seen_custom, name, value.borrow());
+         }
+     }
+ 
++    // NOTE(jyc) This looks a lot like CSSVariableResolver.
+     let custom_properties =
+         ::custom_properties::finish_cascade(
+             custom_properties, &inherited_custom_properties);
+ 
+     let reset_style = if flags.contains(INHERIT_ALL) {
+         inherited_style
+     } else {
+         default_style
+diff -r f1007237a8b4 components/style/rule_tree/mod.rs
+--- a/components/style/rule_tree/mod.rs	Mon Jul 10 11:33:04 2017 -0700
++++ b/components/style/rule_tree/mod.rs	Tue Jul 11 20:25:08 2017 -0700
+@@ -101,17 +101,17 @@ impl StyleSource {
+     fn dump<W: Write>(&self, guard: &SharedRwLockReadGuard, writer: &mut W) {
+         use self::StyleSource::*;
+ 
+         if let Style(ref rule) = *self {
+             let rule = rule.read_with(guard);
+             let _ = write!(writer, "{:?}", rule.selectors);
+         }
+ 
+-        let _ = write!(writer, "  -> {:?}", self.read(guard).declarations());
++        let _ = write!(writer, "  -> {:?}", self.read(guard).declarations().collect::<Vec<_>>());
+     }
+ 
+     /// Read the style source guard, and obtain thus read access to the
+     /// underlying property declaration block.
+     #[inline]
+     pub fn read<'a>(&'a self, guard: &'a SharedRwLockReadGuard) -> &'a PropertyDeclarationBlock {
+         let block = match *self {
+             StyleSource::Style(ref rule) => &rule.read_with(guard).block,
+@@ -1274,18 +1274,17 @@ impl StrongRuleNode {
+         let iter =
+             self.self_and_ancestors()
+                 .skip_while(|node| node.cascade_level() == CascadeLevel::Transitions)
+                 .take_while(|node| node.cascade_level() > CascadeLevel::Animations);
+         let mut result = (LonghandIdSet::new(), false);
+         for node in iter {
+             let style = node.style_source();
+             for &(ref decl, important) in style.read(node.cascade_level().guard(guards))
+-                                               .declarations()
+-                                               .iter() {
++                                               .declarations() {
+                 // Although we are only iterating over cascade levels that
+                 // override animations, in a given property declaration block we
+                 // can have a mixture of !important and non-!important
+                 // declarations but only the !important declarations actually
+                 // override animations.
+                 if important.important() {
+                     match decl.id() {
+                         PropertyDeclarationId::Longhand(id) => result.0.insert(id),
+diff -r f1007237a8b4 components/style/stylesheets/keyframes_rule.rs
+--- a/components/style/stylesheets/keyframes_rule.rs	Mon Jul 10 11:33:04 2017 -0700
++++ b/components/style/stylesheets/keyframes_rule.rs	Tue Jul 11 20:25:08 2017 -0700
+@@ -3,19 +3,21 @@
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ //! Keyframes: https://drafts.csswg.org/css-animations/#keyframes
+ 
+ use cssparser::{AtRuleParser, Parser, QualifiedRuleParser, RuleListParser, ParserInput, CompactCowStr};
+ use cssparser::{DeclarationListParser, DeclarationParser, parse_one_rule, SourceLocation};
+ use error_reporting::{NullReporter, ContextualParseError};
+ use parser::{ParserContext, log_css_error};
++use parking_lot::RwLock;
+ use properties::{Importance, PropertyDeclaration, PropertyDeclarationBlock, PropertyId};
+ use properties::{PropertyDeclarationId, LonghandId, SourcePropertyDeclaration};
+ use properties::LonghandIdSet;
++use properties_and_values::RegisteredPropertySet;
+ use properties::animated_properties::AnimatableLonghand;
+ use properties::longhands::transition_timing_function::single_value::SpecifiedValue as SpecifiedTimingFunction;
+ use selectors::parser::SelectorParseError;
+ use shared_lock::{DeepCloneParams, DeepCloneWithLock, SharedRwLock, SharedRwLockReadGuard, Locked, ToCssWithGuard};
+ use std::fmt;
+ use style_traits::{PARSING_MODE_DEFAULT, ToCss, ParseError, StyleParseError};
+ use stylearc::Arc;
+ use stylesheets::{CssRuleType, StylesheetContents};
+@@ -205,25 +207,27 @@ impl ToCssWithGuard for Keyframe {
+ }
+ 
+ impl Keyframe {
+     /// Parse a CSS keyframe.
+     pub fn parse<'i>(
+         css: &'i str,
+         parent_stylesheet_contents: &StylesheetContents,
+         lock: &SharedRwLock,
++        registered_property_set: Arc<RwLock<RegisteredPropertySet>>,
+     ) -> Result<Arc<Locked<Self>>, ParseError<'i>> {
+         let url_data = parent_stylesheet_contents.url_data.read();
+         let error_reporter = NullReporter;
+         let context = ParserContext::new(parent_stylesheet_contents.origin,
+                                          &url_data,
+                                          &error_reporter,
+                                          Some(CssRuleType::Keyframe),
+                                          PARSING_MODE_DEFAULT,
+-                                         parent_stylesheet_contents.quirks_mode);
++                                         parent_stylesheet_contents.quirks_mode,
++                                         Some(registered_property_set));
+         let mut input = ParserInput::new(css);
+         let mut input = Parser::new(&mut input);
+ 
+         let mut declarations = SourcePropertyDeclaration::new();
+         let mut rule_parser = KeyframeListParser {
+             context: &context,
+             shared_lock: &lock,
+             declarations: &mut declarations,
+@@ -284,17 +288,17 @@ pub struct KeyframesStep {
+ 
+ impl KeyframesStep {
+     #[inline]
+     fn new(percentage: KeyframePercentage,
+            value: KeyframesStepValue,
+            guard: &SharedRwLockReadGuard) -> Self {
+         let declared_timing_function = match value {
+             KeyframesStepValue::Declarations { ref block } => {
+-                block.read_with(guard).declarations().iter().any(|&(ref prop_decl, _)| {
++                block.read_with(guard).declarations().any(|&(ref prop_decl, _)| {
+                     match *prop_decl {
+                         PropertyDeclaration::AnimationTimingFunction(..) => true,
+                         _ => false,
+                     }
+                 })
+             }
+             _ => false,
+         };
+@@ -354,17 +358,17 @@ fn get_animated_properties(keyframes: &[
+                            -> Vec<AnimatableLonghand> {
+     let mut ret = vec![];
+     let mut seen = LonghandIdSet::new();
+     // NB: declarations are already deduplicated, so we don't have to check for
+     // it here.
+     for keyframe in keyframes {
+         let keyframe = keyframe.read_with(&guard);
+         let block = keyframe.block.read_with(guard);
+-        for &(ref declaration, importance) in block.declarations().iter() {
++        for &(ref declaration, importance) in block.declarations() {
+             assert!(!importance.important());
+ 
+             if let Some(property) = AnimatableLonghand::from_declaration(declaration) {
+                 // Skip the 'display' property because although it is animatable from SMIL,
+                 // it should not be animatable from CSS Animations or Web Animations.
+                 if property != AnimatableLonghand::Display &&
+                    !seen.has_animatable_longhand_bit(&property) {
+                     seen.set_animatable_longhand_bit(&property);
+@@ -486,17 +490,17 @@ impl<'a, 'i> QualifiedRuleParser<'i> for
+     fn parse_block<'t>(&mut self, prelude: Self::Prelude, input: &mut Parser<'i, 't>)
+                        -> Result<Self::QualifiedRule, ParseError<'i>> {
+         let context = ParserContext::new_with_rule_type(self.context, Some(CssRuleType::Keyframe));
+         let parser = KeyframeDeclarationParser {
+             context: &context,
+             declarations: self.declarations,
+         };
+         let mut iter = DeclarationListParser::new(input, parser);
+-        let mut block = PropertyDeclarationBlock::new();
++        let mut block = PropertyDeclarationBlock::new(context.registered_property_set.clone());
+         while let Some(declaration) = iter.next() {
+             match declaration {
+                 Ok(()) => {
+                     block.extend(iter.parser.declarations.drain(), Importance::Normal);
+                 }
+                 Err(err) => {
+                     iter.parser.declarations.clear();
+                     let pos = err.span.start;
+diff -r f1007237a8b4 components/style/stylesheets/mod.rs
+--- a/components/style/stylesheets/mod.rs	Mon Jul 10 11:33:04 2017 -0700
++++ b/components/style/stylesheets/mod.rs	Tue Jul 11 20:25:08 2017 -0700
+@@ -19,18 +19,20 @@ mod rule_parser;
+ mod rules_iterator;
+ mod style_rule;
+ mod stylesheet;
+ pub mod supports_rule;
+ pub mod viewport_rule;
+ 
+ use cssparser::{parse_one_rule, Parser, ParserInput};
+ use error_reporting::NullReporter;
++use parking_lot::RwLock;
+ use parser::ParserContext;
+ use shared_lock::{DeepCloneParams, DeepCloneWithLock, Locked, SharedRwLock, SharedRwLockReadGuard, ToCssWithGuard};
++use properties_and_values::RegisteredPropertySet;
+ use std::fmt;
+ use style_traits::PARSING_MODE_DEFAULT;
+ use stylearc::Arc;
+ 
+ pub use self::counter_style_rule::CounterStyleRule;
+ pub use self::document_rule::DocumentRule;
+ pub use self::font_face_rule::FontFaceRule;
+ pub use self::import_rule::ImportRule;
+@@ -219,27 +221,29 @@ impl CssRule {
+     /// Returns a parsed CSS rule and the final state of the parser.
+     ///
+     /// Input state is None for a nested rule
+     pub fn parse(
+         css: &str,
+         parent_stylesheet_contents: &StylesheetContents,
+         shared_lock: &SharedRwLock,
+         state: Option<State>,
+-        loader: Option<&StylesheetLoader>
++        loader: Option<&StylesheetLoader>,
++        registered_property_set: Arc<RwLock<RegisteredPropertySet>>
+     ) -> Result<(Self, State), SingleRuleParseError> {
+         let url_data = parent_stylesheet_contents.url_data.read();
+         let error_reporter = NullReporter;
+         let context = ParserContext::new(
+             parent_stylesheet_contents.origin,
+             &url_data,
+             &error_reporter,
+             None,
+             PARSING_MODE_DEFAULT,
+             parent_stylesheet_contents.quirks_mode,
++            Some(registered_property_set)
+         );
+ 
+         let mut input = ParserInput::new(css);
+         let mut input = Parser::new(&mut input);
+ 
+         let mut guard = parent_stylesheet_contents.namespaces.write();
+ 
+         // nested rules are in the body state
+diff -r f1007237a8b4 components/style/stylesheets/page_rule.rs
+--- a/components/style/stylesheets/page_rule.rs	Mon Jul 10 11:33:04 2017 -0700
++++ b/components/style/stylesheets/page_rule.rs	Tue Jul 11 20:25:08 2017 -0700
+@@ -34,17 +34,17 @@ impl ToCssWithGuard for PageRule {
+     /// Serialization of PageRule is not specced, adapted from steps for
+     /// StyleRule.
+     fn to_css<W>(&self, guard: &SharedRwLockReadGuard, dest: &mut W) -> fmt::Result
+         where W: fmt::Write,
+     {
+         dest.write_str("@page { ")?;
+         let declaration_block = self.block.read_with(guard);
+         declaration_block.to_css(dest)?;
+-        if !declaration_block.declarations().is_empty() {
++        if declaration_block.declarations().next().is_some() {
+             dest.write_str(" ")?;
+         }
+         dest.write_str("}")
+     }
+ }
+ 
+ impl DeepCloneWithLock for PageRule {
+     fn deep_clone_with_lock(
+diff -r f1007237a8b4 components/style/stylesheets/rule_list.rs
+--- a/components/style/stylesheets/rule_list.rs	Mon Jul 10 11:33:04 2017 -0700
++++ b/components/style/stylesheets/rule_list.rs	Tue Jul 11 20:25:08 2017 -0700
+@@ -1,14 +1,17 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ //! A list of CSS rules.
+ 
++use parking_lot::RwLock;
++use properties::declaration_block::PropertyDeclarationBlock;
++use properties_and_values::RegisteredPropertySet;
+ use shared_lock::{DeepCloneParams, DeepCloneWithLock, Locked, SharedRwLock, SharedRwLockReadGuard};
+ use stylearc::Arc;
+ use stylesheets::{CssRule, RulesMutateError};
+ use stylesheets::loader::StylesheetLoader;
+ use stylesheets::memory::{MallocSizeOfFn, MallocSizeOfWithGuard};
+ use stylesheets::rule_parser::State;
+ use stylesheets::stylesheet::StylesheetContents;
+ 
+@@ -100,28 +103,38 @@ pub trait CssRulesHelpers {
+     /// TODO(emilio): We could also pass the write guard down into the loader
+     /// instead, but that seems overkill.
+     fn insert_rule(&self,
+                    lock: &SharedRwLock,
+                    rule: &str,
+                    parent_stylesheet_contents: &StylesheetContents,
+                    index: usize,
+                    nested: bool,
+-                   loader: Option<&StylesheetLoader>)
++                   loader: Option<&StylesheetLoader>,
++                   registered_property_set: Arc<RwLock<RegisteredPropertySet>>)
+                    -> Result<CssRule, RulesMutateError>;
++
++    /// Append all of the PropertyDeclarationBlocks contained in this CssRules
++    /// as well as in any children to the provided `pdbs` vector.
++    fn append_property_declaration_blocks(
++        &self,
++        guard: &SharedRwLockReadGuard,
++        pdbs: &mut Vec<Arc<Locked<PropertyDeclarationBlock>>>
++    );
+ }
+ 
+ impl CssRulesHelpers for Arc<Locked<CssRules>> {
+     fn insert_rule(&self,
+                    lock: &SharedRwLock,
+                    rule: &str,
+                    parent_stylesheet_contents: &StylesheetContents,
+                    index: usize,
+                    nested: bool,
+-                   loader: Option<&StylesheetLoader>)
++                   loader: Option<&StylesheetLoader>,
++                   registered_property_set: Arc<RwLock<RegisteredPropertySet>>)
+                    -> Result<CssRule, RulesMutateError> {
+         let state = {
+             let read_guard = lock.read();
+             let rules = self.read_with(&read_guard);
+ 
+             // Step 1, 2
+             if index > rules.0.len() {
+                 return Err(RulesMutateError::IndexSize);
+@@ -140,17 +153,18 @@ impl CssRulesHelpers for Arc<Locked<CssR
+         // Step 3, 4
+         // XXXManishearth should we also store the namespace map?
+         let (new_rule, new_state) =
+             CssRule::parse(
+                 &rule,
+                 parent_stylesheet_contents,
+                 lock,
+                 state,
+-                loader
++                loader,
++                registered_property_set
+             )?;
+ 
+         {
+             let mut write_guard = lock.write();
+             let mut rules = self.write_with(&mut write_guard);
+             // Step 5
+             // Computes the maximum allowed parser state at a given index.
+             let rev_state = rules.0.get(index).map_or(State::Body, CssRule::rule_state);
+@@ -167,9 +181,45 @@ impl CssRulesHelpers for Arc<Locked<CssR
+                 }
+             }
+ 
+             rules.0.insert(index, new_rule.clone());
+         }
+ 
+         Ok(new_rule)
+     }
++
++    fn append_property_declaration_blocks(
++        &self,
++        guard: &SharedRwLockReadGuard,
++        pdbs: &mut Vec<Arc<Locked<PropertyDeclarationBlock>>>,
++    ) {
++        for rule in &self.read_with(guard).0 {
++            match *rule {
++                CssRule::Namespace(_) => (),
++                CssRule::Import(ref rule) =>
++                    rule.read_with(guard).stylesheet.0.contents.rules
++                        .append_property_declaration_blocks(guard, pdbs),
++                CssRule::Style(ref rule) =>
++                    pdbs.push(rule.read_with(guard).block.clone()),
++                CssRule::Media(ref rule) =>
++                    rule.read_with(guard).rules
++                        .append_property_declaration_blocks(guard, pdbs),
++                CssRule::FontFace(_) => (),
++                CssRule::CounterStyle(_) => (),
++                CssRule::Viewport(_) => (),
++                CssRule::Keyframes(ref rule) => {
++                    for keyframe in &rule.read_with(guard).keyframes {
++                        pdbs.push(keyframe.read_with(guard).block.clone())
++                    }
++                },
++                CssRule::Supports(ref rule) =>
++                    rule.read_with(guard).rules
++                        .append_property_declaration_blocks(guard, pdbs),
++                CssRule::Page(ref rule) =>
++                    pdbs.push(rule.read_with(guard).block.clone()),
++                CssRule::Document(ref rule) =>
++                    rule.read_with(guard).rules
++                        .append_property_declaration_blocks(guard, pdbs)
++            }
++        }
++    }
+ }
+diff -r f1007237a8b4 components/style/stylesheets/style_rule.rs
+--- a/components/style/stylesheets/style_rule.rs	Mon Jul 10 11:33:04 2017 -0700
++++ b/components/style/stylesheets/style_rule.rs	Tue Jul 11 20:25:08 2017 -0700
+@@ -62,16 +62,16 @@ impl ToCssWithGuard for StyleRule {
+         // Step 1
+         self.selectors.to_css(dest)?;
+         // Step 2
+         dest.write_str(" { ")?;
+         // Step 3
+         let declaration_block = self.block.read_with(guard);
+         declaration_block.to_css(dest)?;
+         // Step 4
+-        if !declaration_block.declarations().is_empty() {
++        if declaration_block.declarations().next().is_some() {
+             dest.write_str(" ")?;
+         }
+         // Step 5
+         dest.write_str("}")
+     }
+ }
+ 
+diff -r f1007237a8b4 components/style/stylesheets/stylesheet.rs
+--- a/components/style/stylesheets/stylesheet.rs	Mon Jul 10 11:33:04 2017 -0700
++++ b/components/style/stylesheets/stylesheet.rs	Tue Jul 11 20:25:08 2017 -0700
+@@ -5,16 +5,17 @@
+ use {Prefix, Namespace};
+ use context::QuirksMode;
+ use cssparser::{Parser, RuleListParser, ParserInput};
+ use error_reporting::{ParseErrorReporter, ContextualParseError};
+ use fnv::FnvHashMap;
+ use media_queries::{MediaList, Device};
+ use parking_lot::RwLock;
+ use parser::{ParserContext, log_css_error};
++use properties_and_values::RegisteredPropertySet;
+ use shared_lock::{DeepCloneParams, DeepCloneWithLock, Locked, SharedRwLock, SharedRwLockReadGuard};
+ use std::mem;
+ use std::sync::atomic::{AtomicBool, Ordering};
+ use style_traits::PARSING_MODE_DEFAULT;
+ use stylearc::Arc;
+ use stylesheets::{CssRule, CssRules, Origin, UrlExtraData};
+ use stylesheets::loader::StylesheetLoader;
+ use stylesheets::memory::{MallocSizeOfFn, MallocSizeOfWithGuard};
+@@ -67,29 +68,31 @@ impl StylesheetContents {
+     pub fn from_str(
+         css: &str,
+         url_data: UrlExtraData,
+         origin: Origin,
+         shared_lock: &SharedRwLock,
+         stylesheet_loader: Option<&StylesheetLoader>,
+         error_reporter: &ParseErrorReporter,
+         quirks_mode: QuirksMode,
+-        line_number_offset: u64
++        line_number_offset: u64,
++        registered_property_set: Option<Arc<RwLock<RegisteredPropertySet>>>,
+     ) -> Self {
+         let namespaces = RwLock::new(Namespaces::default());
+         let (rules, dirty_on_viewport_size_change) = Stylesheet::parse_rules(
+             css,
+             &url_data,
+             origin,
+             &mut *namespaces.write(),
+             &shared_lock,
+             stylesheet_loader,
+             error_reporter,
+             quirks_mode,
+             line_number_offset,
++            registered_property_set,
+         );
+ 
+         Self {
+             rules: CssRules::new(rules, &shared_lock),
+             origin: origin,
+             url_data: RwLock::new(url_data),
+             namespaces: namespaces,
+             dirty_on_viewport_size_change: AtomicBool::new(dirty_on_viewport_size_change),
+@@ -272,29 +275,31 @@ impl StylesheetInDocument for Stylesheet
+ 
+ impl Stylesheet {
+     /// Updates an empty stylesheet from a given string of text.
+     pub fn update_from_str(existing: &Stylesheet,
+                            css: &str,
+                            url_data: UrlExtraData,
+                            stylesheet_loader: Option<&StylesheetLoader>,
+                            error_reporter: &ParseErrorReporter,
+-                           line_number_offset: u64) {
++                           line_number_offset: u64,
++                           registered_property_set: Option<Arc<RwLock<RegisteredPropertySet>>>) {
+         let namespaces = RwLock::new(Namespaces::default());
+         let (rules, dirty_on_viewport_size_change) =
+             Stylesheet::parse_rules(
+                 css,
+                 &url_data,
+                 existing.contents.origin,
+                 &mut *namespaces.write(),
+                 &existing.shared_lock,
+                 stylesheet_loader,
+                 error_reporter,
+                 existing.contents.quirks_mode,
+-                line_number_offset
++                line_number_offset,
++                registered_property_set
+             );
+ 
+         *existing.contents.url_data.write() = url_data;
+         mem::swap(
+             &mut *existing.contents.namespaces.write(),
+             &mut *namespaces.write()
+         );
+         existing.contents.dirty_on_viewport_size_change
+@@ -309,30 +314,32 @@ impl Stylesheet {
+         css: &str,
+         url_data: &UrlExtraData,
+         origin: Origin,
+         namespaces: &mut Namespaces,
+         shared_lock: &SharedRwLock,
+         stylesheet_loader: Option<&StylesheetLoader>,
+         error_reporter: &ParseErrorReporter,
+         quirks_mode: QuirksMode,
+-        line_number_offset: u64
++        line_number_offset: u64,
++        registered_property_set: Option<Arc<RwLock<RegisteredPropertySet>>>
+     ) -> (Vec<CssRule>, bool) {
+         let mut rules = Vec::new();
+         let mut input = ParserInput::new(css);
+         let mut input = Parser::new(&mut input);
+ 
+         let context =
+             ParserContext::new_with_line_number_offset(
+                 origin,
+                 url_data,
+                 error_reporter,
+                 line_number_offset,
+                 PARSING_MODE_DEFAULT,
+-                quirks_mode
++                quirks_mode,
++                registered_property_set
+             );
+ 
+         let rule_parser = TopLevelRuleParser {
+             stylesheet_origin: origin,
+             shared_lock: shared_lock,
+             loader: stylesheet_loader,
+             context: context,
+             state: State::Start,
+@@ -369,27 +376,29 @@ impl Stylesheet {
+     pub fn from_str(css: &str,
+                     url_data: UrlExtraData,
+                     origin: Origin,
+                     media: Arc<Locked<MediaList>>,
+                     shared_lock: SharedRwLock,
+                     stylesheet_loader: Option<&StylesheetLoader>,
+                     error_reporter: &ParseErrorReporter,
+                     quirks_mode: QuirksMode,
+-                    line_number_offset: u64)
++                    line_number_offset: u64,
++                    registered_property_set: Option<Arc<RwLock<RegisteredPropertySet>>>)
+                     -> Stylesheet {
+         let contents = StylesheetContents::from_str(
+             css,
+             url_data,
+             origin,
+             &shared_lock,
+             stylesheet_loader,
+             error_reporter,
+             quirks_mode,
+-            line_number_offset
++            line_number_offset,
++            registered_property_set
+         );
+ 
+         Stylesheet {
+             contents,
+             shared_lock,
+             media,
+             disabled: AtomicBool::new(false),
+         }
+diff -r e64e219e7de0 -r 4291ab290153 components/script/dom/css.rs
+--- a/components/script/dom/css.rs	Tue Jul 11 20:25:07 2017 -0700
++++ b/components/script/dom/css.rs	Mon Jul 17 12:48:27 2017 -0700
+@@ -7,17 +7,17 @@ use dom::bindings::codegen::Bindings::Pr
+ use dom::bindings::codegen::Bindings::WindowBinding::WindowBinding::WindowMethods;
+ use dom::bindings::error::{Error, Fallible};
+ use dom::bindings::reflector::Reflector;
+ use dom::bindings::str::DOMString;
+ use dom::window::Window;
+ use dom_struct::dom_struct;
+ use style::context::QuirksMode;
+ use style::parser::ParserContext;
+-use style::properties_and_values::Syntax;
++use style::properties_and_values::{Registration, Syntax};
+ use style::stylesheets::CssRuleType;
+ use style::stylesheets::supports_rule::{Declaration, parse_condition_or_declaration};
+ use style_traits::PARSING_MODE_DEFAULT;
+ 
+ #[dom_struct]
+ pub struct CSS {
+     reflector_: Reflector,
+ }
+@@ -58,19 +58,57 @@ impl CSS {
+                                                        /* registeredPropertySet */ None);
+             cond.eval(&context)
+         } else {
+             false
+         }
+     }
+ 
+     // https://drafts.css-houdini.org/css-properties-values-api/#dom-css-registerproperty
+-    pub fn RegisterProperty(_: &Window, options: &PropertyDescriptorDict) -> Result<(), Error> {
+-        // Implemented by a later patch in this series.
+-        Err(Error::NotSupported)
++    pub fn RegisterProperty(win: &Window, options: &PropertyDescriptorDict) -> Result<(), Error> {
++        let syntax = match Syntax::from_string(&options.syntax) {
++            Ok(syntax) => syntax,
++            Err(()) => return Err(Error::Syntax),
++        };
++
++        let url = win.Document().url();
++        let context = ParserContext::new_for_cssom(
++            &url,
++            win.css_error_reporter(),
++            /* rule_type */ None,
++            PARSING_MODE_DEFAULT,
++            win.Document().quirks_mode(),
++            /* registeredPropertySet */ None
++        );
++        let initial_value = match options.initialValue {
++            Some(ref css) => {
++                let mut input = ParserInput::new(css);
++                let mut input = Parser::new(&mut input);
++                match syntax.parse(&context, &mut input) {
++                    // TODO check for whether this is computationally
++                    // independent
++                    Ok(value) => Some(value),
++                    Err(_) => return Err(Error::Syntax)
++                }
++            },
++            None => None,
++        };
++
++        let lock = win.Document().registered_property_set();
++        let mut set = lock.write();
++        match set.register_property(Registration {
++            // TODO check whether the name is a valid name
++            name: (*options.name).into(),
++            syntax: syntax,
++            inherits: options.inherits,
++            initial_value: initial_value,
++        }) {
++            Ok(()) => Ok(()),
++            Err(()) => Err(Error::InvalidModification),
++        }
+     }
+ 
+     // https://drafts.css-houdini.org/css-properties-values-api/#dom-css-unregisterproperty
+     pub fn UnregisterProperty(_: &Window, name: DOMString) -> Result<(), Error> {
+         println!("output: {:?}", Syntax::from_string(&name));
+         // Implemented by a later patch in this series.
+         Err(Error::NotSupported)
+     }
+diff -r e64e219e7de0 -r 4291ab290153 components/script/dom/document.rs
+--- a/components/script/dom/document.rs	Tue Jul 11 20:25:07 2017 -0700
++++ b/components/script/dom/document.rs	Mon Jul 17 12:48:27 2017 -0700
+@@ -548,16 +548,18 @@ impl Document {
+     }
+ 
+     pub fn set_quirks_mode(&self, mode: QuirksMode) {
+         self.quirks_mode.set(mode);
+ 
+         if mode == QuirksMode::Quirks {
+             self.window.layout_chan().send(Msg::SetQuirksMode(mode)).unwrap();
+         }
++
++        self.recompute_declaration_validities();
+     }
+ 
+     pub fn encoding(&self) -> EncodingRef {
+         self.encoding.get()
+     }
+ 
+     pub fn set_encoding(&self, encoding: EncodingRef) {
+         self.encoding.set(encoding);
+@@ -2345,31 +2347,46 @@ impl Document {
+                 .filter_map(|node| {
+                     node.get_stylesheet()
+                         .map(|stylesheet| StylesheetInDocument {
+                             node: JS::from_ref(&*node),
+                             stylesheet: stylesheet,
+                         })
+                 })
+                 .collect());
+-
+-            // Recompute declaration validities.
+-            let mut pdbs = Vec::new();
+-            {
+-                let guard = self.style_shared_lock.read();
+-                for stylesheet in stylesheets.as_ref().unwrap() {
+-                    stylesheet.stylesheet.contents.rules
+-                              .append_property_declaration_blocks(&guard, &mut pdbs);
+-                }
++            self.recompute_declaration_validities();
++        };
++    }
++
++    // Recompute declaration validities for all declaration blocks.
++    // Must be called whenever before reading from declaration blocks when
++    // something has happened that might have changed whether or not a
++    // declaration is valid, in particular:
++    // - a call to CSS.(un)registerProperty
++    // - setting quirks mode
++    // This can definitely be called lazily and should not be called all the
++    // time. Currently we call it after stylesheets are invalidated, and
++    // recompute validities for individual declaration blocks when accessing
++    // through CSSOM (in case they have been detached from the document).
++    fn recompute_declaration_validities(&self) {
++        let stylesheets = self.stylesheets.borrow_mut();
++        let stylesheets = stylesheets.as_ref().unwrap();
++        // Recompute declaration validities.
++        let mut pdbs = Vec::new();
++        {
++            let guard = self.style_shared_lock.read();
++            for stylesheet in stylesheets {
++                stylesheet.stylesheet.contents.rules
++                          .append_property_declaration_blocks(&guard, &mut pdbs);
+             }
+-            let mut guard = self.style_shared_lock.write();
+-            for pdb in pdbs {
+-                pdb.write_with(&mut guard).recompute_validities(self.quirks_mode.get());
+-            }
+-        };
++        }
++        let mut guard = self.style_shared_lock.write();
++        for pdb in pdbs {
++            pdb.write_with(&mut guard).recompute_validities(self.quirks_mode.get());
++        }
+     }
+ 
+     /// Return a reference to the per-document shared lock used in stylesheets.
+     pub fn style_shared_lock(&self) -> &StyleSharedRwLock {
+         &self.style_shared_lock
+     }
+ 
+     /// Returns the list of stylesheets associated with nodes in the document.
+diff -r e64e219e7de0 -r 4291ab290153 components/style/properties/declaration_block.rs
+--- a/components/style/properties/declaration_block.rs	Tue Jul 11 20:25:07 2017 -0700
++++ b/components/style/properties/declaration_block.rs	Mon Jul 17 12:48:27 2017 -0700
+@@ -1,9 +1,10 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
++ *
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ //! A property declaration block.
+ 
+ #![allow(dead_code)]
+ #![deny(missing_docs)]
+ 
+@@ -45,17 +46,17 @@ impl<'a> AnimationRules<'a> {
+         self.0.is_none() && self.1.is_none()
+     }
+ }
+ 
+ /// A declaration [importance][importance].
+ ///
+ /// [importance]: https://drafts.csswg.org/css-cascade/#importance
+ #[cfg_attr(feature = "servo", derive(HeapSizeOf))]
+-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
++#[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Eq, Hash, Ord)]
+ pub enum Importance {
+     /// Indicates a declaration without `!important`.
+     Normal,
+ 
+     /// Indicates a declaration with `!important`.
+     Important,
+ }
+ 
+@@ -84,99 +85,136 @@ struct RegisteredPropertyItem {
+     name: ::custom_properties::Name,
+     /// The specified value for this property, when we are able to parse it.
+     parsed_value: Option<::properties_and_values::SpecifiedValue>,
+ }
+ 
+ #[derive(Clone)]
+ struct RegisteredPropertyData {
+     /// registered_property_set.generation() at the last time we recomputed all
+-    /// the valid declarations
++    /// the valid declarations.
+     total_generation: u32,
+ 
++    /// The quirks mode at the last time we recomputed validities.
++    quirks_mode: QuirksMode,
++
+     /// variable name (without --) → variable ID
+     ids: HashMap<::custom_properties::Name, usize>,
+ 
+     /// variable ID → data regarding this variable
+     items: Vec<RegisteredPropertyItem>,
+ }
+ 
+ struct PropertyDeclarationBlockIteratorData<'a> {
+-    pdb: &'a PropertyDeclarationBlock,
++    set_and_data: &'a RegisteredPropertySetAndData,
+     iter: Enumerate<Iter<'a, (PropertyDeclaration, Importance)>>,
+ }
+ 
+ /// An iterator over declarations and their importances.
+ pub struct PropertyDeclarationBlockIterator<'a> {
+     data: Option<PropertyDeclarationBlockIteratorData<'a>>,
+ }
+ 
++// XXX maybe remove these
++//struct PropertyDeclarationBlockIteratorMutData<'a> {
++//    set_and_data: &'a RegisteredPropertySetAndData,
++//    iter: Enumerate<IterMut<'a, (PropertyDeclaration, Importance)>>,
++//}
++//
++//struct PropertyDeclarationBlockIteratorMut<'a> {
++//    data: Option<PropertyDeclarationBlockIteratorMutData<'a>>,
++//}
++//
+ impl<'a> PropertyDeclarationBlockIterator<'a> {
+     /// Create a PropertyDeclarationBlockIterator from a
+     /// PropertyDeclarationBlock.
+-    pub fn new(pdb: &'a PropertyDeclarationBlock) -> Self {
++    fn new(
++        set_and_data: &'a RegisteredPropertySetAndData,
++        declarations: &'a Vec<(PropertyDeclaration, Importance)>
++    ) -> Self {
+         PropertyDeclarationBlockIterator {
+             data: Some(PropertyDeclarationBlockIteratorData {
+-                pdb: pdb,
+-                iter: pdb.declarations.iter().enumerate(),
++                set_and_data: set_and_data,
++                iter: declarations.iter().enumerate(),
+             }),
+         }
+     }
+ 
+     /// Create an empty PropertyDeclarationBlockIterator.
+     pub fn empty() -> Self {
+         PropertyDeclarationBlockIterator {
+             data: None,
+         }
+     }
+ }
+ 
+-impl<'a> Iterator for PropertyDeclarationBlockIterator<'a> {
+-    type Item = &'a (PropertyDeclaration, Importance);
++//impl<'a> PropertyDeclarationBlockIteratorMut<'a> {
++//    // Be as precise about what we need to borrow mutably as possible.
++//    fn new(
++//        set_and_data: &'a RegisteredPropertySetAndData,
++//        declarations: &'a mut Vec<(PropertyDeclaration, Importance)>
++//    ) -> Self {
++//        PropertyDeclarationBlockIteratorMut {
++//            data: Some(PropertyDeclarationBlockIteratorMutData {
++//                set_and_data: set_and_data,
++//                iter: declarations.iter_mut().enumerate(),
++//            }),
++//        }
++//    }
++//}
+ 
+-    // Seems we can't just use filter because that requires a closure (can't
+-    // partially apply a method). Using this struct keeps everything sized.
+-    fn next(&mut self) -> Option<Self::Item> {
+-        let mut data = match self.data {
+-            None => return None,
+-            Some(ref mut data) => data
+-        };
++macro_rules! impl_pdb_iterator {
++    ($name:ident) => {
++        fn $name(&mut self) -> Option<Self::Item> {
++            let mut data = match self.data {
++                None => return None,
++                Some(ref mut data) => data,
++            };
+ 
+-        loop {
+-            match data.iter.next() {
+-                None => return None,
+-                Some(x) => {
+-                    if data.pdb.is_used_declaration(x) {
+-                        return Some(x.1)
++            loop {
++                match data.iter.$name() {
++                    None => return None,
++                    Some((decl_id, decl)) => {
++                        if PropertyDeclarationBlock::is_used_declaration(
++                            data.set_and_data,
++                            decl_id,
++                            &(*decl).0
++                        ) {
++                            return Some(decl)
++                        }
+                     }
+                 }
+             }
+         }
+     }
+ }
+ 
++impl<'a> Iterator for PropertyDeclarationBlockIterator<'a> {
++    type Item = &'a (PropertyDeclaration, Importance);
++
++    // Seems we can't just use filter because that requires a closure (can't
++    // partially apply a method). Using this struct keeps everything sized.
++    impl_pdb_iterator!(next);
++}
++
+ impl<'a> DoubleEndedIterator for PropertyDeclarationBlockIterator<'a> {
+-    fn next_back(&mut self) -> Option<Self::Item> {
+-        let mut data = match self.data {
+-            None => return None,
+-            Some(ref mut data) => data
+-        };
++    impl_pdb_iterator!(next_back);
++}
+ 
+-        loop {
+-            match data.iter.next_back() {
+-                None => return None,
+-                Some(x) => {
+-                    if data.pdb.is_used_declaration(x) {
+-                        return Some(x.1)
+-                    }
+-                }
+-            }
+-        }
+-    }
+-}
++//impl<'a> Iterator for PropertyDeclarationBlockIteratorMut<'a> {
++//    type Item = &'a mut (PropertyDeclaration, Importance);
++//    impl_pdb_iterator!(next);
++//}
++//
++//impl<'a> DoubleEndedIterator for PropertyDeclarationBlockIteratorMut<'a> {
++//    impl_pdb_iterator!(next_back);
++//}
++
++type RegisteredPropertySetAndData = Option<(Arc<RwLock<RegisteredPropertySet>>,
++                                            Option<Box<RegisteredPropertyData>>)>;
+ 
+ /// Overridden declarations are skipped.
+ #[derive(Clone)]
+ pub struct PropertyDeclarationBlock {
+     /// declaration id → declaration
+     declarations: Vec<(PropertyDeclaration, Importance)>,
+ 
+     /// The number of used entries in `self.declaration` with
+@@ -186,18 +224,17 @@ pub struct PropertyDeclarationBlock {
+     /// The longhand properties for which we have declarations.
+     longhands: LonghandIdSet,
+ 
+     /// The set of registered custom properties to use when deciding which
+     /// custom property declaration is valid, as well as the data computed
+     /// regarding declarations of registered properties if there are any.
+     /// The behavior if this is None and if the registered property set is empty
+     /// are identical.
+-    registered_property_data: Option<(Arc<RwLock<RegisteredPropertySet>>,
+-                                      Option<Box<RegisteredPropertyData>>)>,
++    registered_property_data: RegisteredPropertySetAndData,
+ }
+ 
+ impl MallocSizeOf for PropertyDeclarationBlock {
+     fn malloc_size_of_children(&self, malloc_size_of: MallocSizeOfFn) -> usize {
+         self.declarations.malloc_size_of_children(malloc_size_of)
+     }
+ }
+ 
+@@ -346,50 +383,54 @@ impl PropertyDeclarationBlock {
+             declarations: vec![(declaration, importance)],
+ 
+             important_count: if importance.important() { 1 } else { 0 },
+             longhands: longhands,
+             registered_property_data: None,
+         }
+     }
+ 
+-    fn is_used_declaration(&self, x: (usize, &(PropertyDeclaration, Importance))) -> bool {
+-        assert_fresh_validities!(self);
+-        let (decl_id, &(ref declaration, _)) = x;
+-        match *declaration {
++    fn is_used_declaration(
++        registered_property_data: &RegisteredPropertySetAndData,
++        decl_id: usize,
++        decl: &PropertyDeclaration
++    ) -> bool {
++        match *decl {
+             PropertyDeclaration::Custom(ref name, _) => {
+                 // Probably want to make this faster?
+-                let data = match self.registered_property_data {
++                let data = match *registered_property_data {
+                     Some((_, Some(ref data))) => data,
+                     _ => return true,
+                 };
+                 let var_id = *data.ids.get(name).unwrap();
+ 
+                 Some(decl_id) == data.items[var_id].used_declaration
+             },
+             _ => true
+         }
+     }
+ 
+     /// The declarations in this block
+     pub fn declarations(&self) -> PropertyDeclarationBlockIterator {
+         assert_fresh_validities!(self);
+-        PropertyDeclarationBlockIterator::new(self)
++        PropertyDeclarationBlockIterator::new(
++            &self.registered_property_data,
++            &self.declarations
++        )
+     }
+ 
+     /// Iterate over only PropertyDeclaration.
+     pub fn declarations_iter(&self) -> PropertyDeclarationIterator {
+         assert_fresh_validities!(self);
+         PropertyDeclarationIterator {
+             iter: self.declarations.iter(),
+         }
+     }
+ 
+     fn compute_validity(registered_property_set: &RegisteredPropertySet,
+-                        name: &::custom_properties::Name,
+                         declaration: &PropertyDeclaration,
+                         quirks_mode: QuirksMode)
+                         -> Result<Option<::properties_and_values::SpecifiedValue>, ()> {
+         // So far, we've parsed the name and the token stream value. Then if
+         // this custom property isn't registered or the value is one of the
+         // CSS-wide keywords, there's no concept of an 'illegal' value that we
+         // ignore, so the last declaration wins.
+         //
+@@ -403,17 +444,17 @@ impl PropertyDeclarationBlock {
+         //   -- CSS Variables
+ 
+         // `result` will be `Some((registration, value))` iff we should
+         // eagerly parse this declaration.
+         let result = match *declaration {
+             PropertyDeclaration::Custom(_, DeclaredValueOwned::CSSWideKeyword(_)) => None,
+             // See the comment on PropertyDeclaration and the asserts in
+             // `custom_properties.rs`.
+-            PropertyDeclaration::Custom(_, DeclaredValueOwned::Value(ref value)) => {
++            PropertyDeclaration::Custom(ref name, DeclaredValueOwned::Value(ref value)) => {
+                 match (!value.has_references(), registered_property_set.get(name)) {
+                     (true, Some(registration)) => Some((registration, value)),
+                     _ => None
+                 }
+             },
+             _ => unreachable!("compute_validity expects custom properties \
+                                only, which only use the Custom variant (and in \
+                                the field of that variant, only the \
+@@ -454,18 +495,21 @@ impl PropertyDeclarationBlock {
+     pub fn recompute_validities(&mut self, quirks_mode: QuirksMode) {
+         // Borrow here so that later on the compiler doesn't try to borrow self
+         // for the closure and then complain.
+         let declarations = &self.declarations;
+         let (lock, mut data) = match self.registered_property_data {
+             Some((ref lock, Some(ref mut data))) => (lock, data),
+             _ => return
+         };
++
++        data.quirks_mode = quirks_mode;
++
+         let set = lock.read();
+-        if data.total_generation == set.generation() { 
++        if data.total_generation == set.generation() {
+             return
+         }
+         // It's important to reset used_declaration in case *no*
+         // declarations are valid for a variable after we recompute.
+         for item in data.items.iter_mut() {
+             item.used_declaration = None
+         }
+         // Check declarations backwards so we compute validity fewer times than
+@@ -479,34 +523,34 @@ impl PropertyDeclarationBlock {
+             let var_id = *data.ids.get(name).unwrap();
+             // This declaration should be strictly more important than the
+             // currently used one in order for us to consider it (we're checking
+             // backwards).
+             match (*importance, data.items[var_id].used_declaration.map(|id| declarations[id].1)) {
+                 (Importance::Normal, None) | (Importance::Important, Some(Importance::Normal)) => (),
+                 _ => continue,
+             }
+-            match PropertyDeclarationBlock::compute_validity(&*set, name, &(*decl).0, quirks_mode) {
++            match PropertyDeclarationBlock::compute_validity(&*set, &(*decl).0, quirks_mode) {
+                 Ok(maybe_parsed) => {
+                     if let parsed @ Some(_) = maybe_parsed {
+                         data.items[var_id].parsed_value = parsed
+                     }
+                     data.items[var_id].used_declaration = Some(decl_id)
+                 },
+                 Err(()) => ()
+             }
+         }
+         // Update important_count.
+         self.important_count = data.items.iter().filter(|item| {
+             match item.used_declaration {
+                 None => false,
+                 Some(decl_id) => declarations[decl_id].1.important()
+             }
+         }).count();
+-        data.total_generation = set.generation()
++        data.total_generation = set.generation();
+     }
+ 
+     /// Return an iterator of (AnimatableLonghand, AnimationValue).
+     pub fn to_animation_value_iter<'a, 'cx, 'cx_a:'cx>(&'a self,
+                                                        context: &'cx mut Context<'cx_a>,
+                                                        default_values: &'a Arc<ComputedValues>)
+                                                        -> AnimationValueIterator<'a, 'cx, 'cx_a> {
+         assert_fresh_validities!(self);
+@@ -637,26 +681,26 @@ impl PropertyDeclarationBlock {
+ 
+     /// Adds or overrides the declaration for a given property in this block,
+     /// **even** if an existing declaration for the same property is more
+     /// important, and reuses the same position in the block.
+     ///
+     /// Returns whether anything changed.
+     pub fn extend_reset(&mut self, drain: SourcePropertyDeclarationDrain,
+                         importance: Importance) -> bool {
+-        assert_fresh_validities!(self);
+         self.extend_common(drain, importance, true)
+     }
+ 
+     fn extend_common(
+         &mut self,
+         mut drain: SourcePropertyDeclarationDrain,
+         importance: Importance,
+         overwrite_more_important_and_reuse_slot: bool,
+     ) -> bool {
++        assert_fresh_validities!(self);
+         let all_shorthand_len = match drain.all_shorthand {
+             AllShorthand::NotSet => 0,
+             AllShorthand::CSSWideKeyword(_) |
+             AllShorthand::WithVariables(_) => ShorthandId::All.longhands().len()
+         };
+         let push_calls_count = drain.declarations.len() + all_shorthand_len;
+ 
+         // With deduplication the actual length increase may be less than this.
+@@ -698,79 +742,130 @@ impl PropertyDeclarationBlock {
+ 
+     /// Adds or overrides the declaration for a given property in this block,
+     /// **except** if an existing declaration for the same property is more
+     /// important.
+     ///
+     /// Ensures that, if inserted, it's inserted at the end of the declaration
+     /// block.
+     pub fn push(&mut self, declaration: PropertyDeclaration, importance: Importance) {
++        assert_fresh_validities!(self);
+         self.push_common(declaration, importance, false);
+     }
+ 
++    #[inline]
++    fn try_update_parsed_value(
++        registered_property_data: &mut RegisteredPropertySetAndData,
++        declaration: &PropertyDeclaration
++    ) -> bool {
++        // TODO is acquiring the lock repeatedly bad for performance?
++        // say if we're called inside of extend.
++        let (lock, mut data) = match registered_property_data {
++            &mut Some((ref lock, Some(ref mut data))) => (lock, data),
++            _ => return true
++        };
++        let set = lock.read();
++        if let &PropertyDeclaration::Custom(ref name, _) = declaration {
++            match PropertyDeclarationBlock::compute_validity(&set, declaration, data.quirks_mode) {
++                Err(()) => false,
++                Ok(x) => {
++                    let var_id = *data.ids.get(name).unwrap();
++                    data.items[var_id].parsed_value = x;
++                    true
++                }
++            }
++        } else {
++            true
++        }
++    }
++
++    /// Adds or overrides the declaration for a given property in this block,
++    /// except if
++    /// - an existing declaration for the same property is more important
++    /// - the declaration is for a registered custom property, and it is invalid
++    ///
++    /// If the declaration is already contained in this
++    /// PropertyDeclarationBlock, the previous declaration is replaced.
++    ///
++    /// Returns true iff the declarations were changed.
+     fn push_common(
+         &mut self,
+         declaration: PropertyDeclaration,
+         importance: Importance,
+         overwrite_more_important_and_reuse_slot: bool
+     ) -> bool {
+-        let definitely_new = if let PropertyDeclarationId::Longhand(id) = declaration.id() {
+-            !self.longhands.contains(id)
+-        } else {
+-            false  // For custom properties, always scan
++        // Note: the caller should have called assert_fresh_validities!(self).
++        // We don't call it here only because this is called repeatedly inside
++        // of extend_common.
++
++        let try_to_replace = match declaration.id() {
++            PropertyDeclarationId::Longhand(id) => self.longhands.contains(id),
++            // If this is a custom property, normally keep around all
++            // declarations: the validity of a particular declaration might
++            // change in the future due to CSS.(un)registerProperty.
++            // However, if `overwrite_more_important_and_reuse_slot` is
++            // specified (e.g. by the implementation of
++            // CSSStyleDeclaration.setProperty) we should replace the
++            // declaration that's currently in use even if this might change
++            // later!
++            // https://drafts.csswg.org/cssom/#dom-cssstyledeclaration-setproperty
++            PropertyDeclarationId::Custom(_) => overwrite_more_important_and_reuse_slot,
+         };
+ 
++        if try_to_replace {
++            let decl_to_remove = {
++                let decl_to_remove = self.declarations.iter().enumerate().find(|x| {
++                    let (decl_id, &(ref other_declaration, ref other_importance)) = *x;
+ 
+-        if !definitely_new {
+-            let mut index_to_remove = None;
+-            for (i, slot) in self.declarations.iter_mut().enumerate() {
+-                if slot.0.id() == declaration.id() {
+-                    match (slot.1, importance) {
+-                        (Importance::Normal, Importance::Important) => {
+-                            self.important_count += 1;
+-                        }
+-                        (Importance::Important, Importance::Normal) => {
+-                            if overwrite_more_important_and_reuse_slot {
+-                                self.important_count -= 1;
+-                            } else {
+-                                return false
+-                            }
+-                        }
+-                        _ => if slot.0 == declaration {
+-                            return false;
+-                        }
+-                    }
++                    other_declaration.id() == declaration.id() &&
++                    (overwrite_more_important_and_reuse_slot ||
++                     *other_importance <= importance) &&
++                    PropertyDeclarationBlock::is_used_declaration(
++                        &self.registered_property_data,
++                        decl_id,
++                        other_declaration
++                    )
++                });
++                match decl_to_remove {
++                    None => None,
++                    Some((id, &(_, ref other_importance))) => Some((id, *other_importance)),
++                }
++            };
+ 
+-                    if overwrite_more_important_and_reuse_slot {
+-                        *slot = (declaration, importance);
+-                        return true;
+-                    }
+-
+-                    // NOTE(emilio): We could avoid this and just override for
+-                    // properties not affected by logical props, but it's not
+-                    // clear it's worth it given the `definitely_new` check.
+-                    index_to_remove = Some(i);
+-                    break;
++            if let Some((id, other_importance)) = decl_to_remove {
++                if !PropertyDeclarationBlock::try_update_parsed_value(
++                    &mut self.registered_property_data,
++                    &declaration
++                ) {
++                    return false
+                 }
+-            }
+-
+-            if let Some(index) = index_to_remove {
+-                self.declarations.remove(index);
+-                self.declarations.push((declaration, importance));
+-                return true;
++                if other_importance != importance {
++                    match (other_importance, importance) {
++                        (Importance::Normal, Importance::Important) =>
++                            self.important_count += 1,
++                        (Importance::Important, Importance::Normal) =>
++                            self.important_count -= 1,
++                        _ => (),
++                    };
++                }
++                if overwrite_more_important_and_reuse_slot {
++                    self.declarations[id] = (declaration, importance)
++                } else {
++                    self.declarations.remove(id);
++                    self.declarations.push((declaration, importance))
++                }
++                return true
+             }
+         }
+ 
++        // We didn't find a declaration to replace. Just append it.
+         if let PropertyDeclarationId::Longhand(id) = declaration.id() {
+             self.longhands.insert(id);
+         }
+         self.declarations.push((declaration, importance));
+-        if importance.important() {
+-            self.important_count += 1;
+-        }
+         true
+     }
+ 
+     /// Set the declaration importance for a given property, if found.
+     ///
+     /// Returns whether any declaration was updated.
+     pub fn set_importance(&mut self, property: &PropertyId, new_importance: Importance) -> bool {
+         assert_fresh_validities!(self);
+diff -r f1007237a8b4 components/layout_thread/lib.rs
+--- a/components/layout_thread/lib.rs	Mon Jul 10 11:33:04 2017 -0700
++++ b/components/layout_thread/lib.rs	Tue Jul 11 20:25:08 2017 -0700
+@@ -1671,43 +1671,48 @@ fn get_root_flow_background_color(flow: 
+     let kid_block_flow = kid.as_block();
+     kid_block_flow.fragment
+                   .style
+                   .resolve_color(kid_block_flow.fragment.style.get_background().background_color)
+                   .to_gfx_color()
+ }
+ 
+ fn get_ua_stylesheets() -> Result<UserAgentStylesheets, &'static str> {
++    // registeredPropertySet is None here because user agent stylesheets should
++    // probably not use CSS variables (or we should first implement separate
++    // sets of variable values for Author and UA stylesheets).
+     fn parse_ua_stylesheet(shared_lock: &SharedRwLock, filename: &'static str)
+                            -> Result<Stylesheet, &'static str> {
+         let res = read_resource_file(filename).map_err(|_| filename)?;
+         Ok(Stylesheet::from_bytes(
+             &res,
+             ServoUrl::parse(&format!("chrome://resources/{:?}", filename)).unwrap(),
+             None,
+             None,
+             Origin::UserAgent,
+             MediaList::empty(),
+             shared_lock.clone(),
+             None,
+             &NullReporter,
+-            QuirksMode::NoQuirks))
++            QuirksMode::NoQuirks,
++            /* registeredPropertySet */ None))
+     }
+ 
+     let shared_lock = SharedRwLock::new();
+     let mut user_or_user_agent_stylesheets = vec!();
+     // FIXME: presentational-hints.css should be at author origin with zero specificity.
+     //        (Does it make a difference?)
+     for &filename in &["user-agent.css", "servo.css", "presentational-hints.css"] {
+         user_or_user_agent_stylesheets.push(parse_ua_stylesheet(&shared_lock, filename)?);
+     }
+     for &(ref contents, ref url) in &opts::get().user_stylesheets {
+         user_or_user_agent_stylesheets.push(Stylesheet::from_bytes(
+             &contents, url.clone(), None, None, Origin::User, MediaList::empty(),
+-            shared_lock.clone(), None, &RustLogReporter, QuirksMode::NoQuirks));
++            shared_lock.clone(), None, &RustLogReporter, QuirksMode::NoQuirks,
++            /* registeredPropertySet */ None));
+     }
+ 
+     let quirks_mode_stylesheet = parse_ua_stylesheet(&shared_lock, "quirks-mode.css")?;
+ 
+     Ok(UserAgentStylesheets {
+         shared_lock: shared_lock,
+         user_or_user_agent_stylesheets: user_or_user_agent_stylesheets,
+         quirks_mode_stylesheet: quirks_mode_stylesheet,
+diff -r f1007237a8b4 components/script/dom/css.rs
+--- a/components/script/dom/css.rs	Mon Jul 10 11:33:04 2017 -0700
++++ b/components/script/dom/css.rs	Tue Jul 11 20:25:08 2017 -0700
+@@ -29,43 +29,49 @@ impl CSS {
+         serialize_identifier(&ident, &mut escaped).unwrap();
+         Ok(DOMString::from(escaped))
+     }
+ 
+     /// https://drafts.csswg.org/css-conditional/#dom-css-supports
+     pub fn Supports(win: &Window, property: DOMString, value: DOMString) -> bool {
+         let decl = Declaration { prop: property.into(), val: value.into() };
+         let url = win.Document().url();
++        // We don't care about the set of registered custom properties here,
++        // according to the spec.
+         let context = ParserContext::new_for_cssom(&url, win.css_error_reporter(), Some(CssRuleType::Supports),
+                                                    PARSING_MODE_DEFAULT,
+-                                                   QuirksMode::NoQuirks);
++                                                   QuirksMode::NoQuirks,
++                                                   /* registeredPropertySet */ None);
+         decl.eval(&context)
+     }
+ 
+     /// https://drafts.csswg.org/css-conditional/#dom-css-supports
+     pub fn Supports_(win: &Window, condition: DOMString) -> bool {
+         let mut input = ParserInput::new(&condition);
+         let mut input = Parser::new(&mut input);
+         let cond = parse_condition_or_declaration(&mut input);
+         if let Ok(cond) = cond {
+             let url = win.Document().url();
++            // We don't care about the set of registered custom properties here,
++            // according to the spec.
+             let context = ParserContext::new_for_cssom(&url, win.css_error_reporter(), Some(CssRuleType::Supports),
+                                                        PARSING_MODE_DEFAULT,
+-                                                       QuirksMode::NoQuirks);
++                                                       QuirksMode::NoQuirks,
++                                                       /* registeredPropertySet */ None);
+             cond.eval(&context)
+         } else {
+             false
+         }
+     }
+
+    // https://drafts.css-houdini.org/css-properties-values-api/#dom-css-registerproperty
+    pub fn RegisterProperty(_: &Window, options: &PropertyDescriptorDict) -> Result<(), Error> {
+        // Implemented by a later patch in this series.
+        Err(Error::NotSupported)
+    }
+
+    // https://drafts.css-houdini.org/css-properties-values-api/#dom-css-unregisterproperty
+    pub fn UnregisterProperty(_: &Window, name: DOMString) -> Result<(), Error> {
+        println!("output: {:?}", Syntax::from_string(&name));
+        // Implemented by a later patch in this series.
+        Err(Error::NotSupported)
+    }
+ }
+diff -r f1007237a8b4 components/script/dom/csskeyframesrule.rs
+--- a/components/script/dom/csskeyframesrule.rs	Mon Jul 10 11:33:04 2017 -0700
++++ b/components/script/dom/csskeyframesrule.rs	Tue Jul 11 20:25:08 2017 -0700
+@@ -9,16 +9,17 @@ use dom::bindings::error::ErrorResult;
+ use dom::bindings::inheritance::Castable;
+ use dom::bindings::js::{MutNullableJS, Root};
+ use dom::bindings::reflector::{DomObject, reflect_dom_object};
+ use dom::bindings::str::DOMString;
+ use dom::csskeyframerule::CSSKeyframeRule;
+ use dom::cssrule::{CSSRule, SpecificCSSRule};
+ use dom::cssrulelist::{CSSRuleList, RulesSource};
+ use dom::cssstylesheet::CSSStyleSheet;
++use dom::node::Node;
+ use dom::window::Window;
+ use dom_struct::dom_struct;
+ use style::shared_lock::{Locked, ToCssWithGuard};
+ use style::stylearc::Arc;
+ use style::stylesheets::keyframes_rule::{KeyframesRule, Keyframe, KeyframeSelector};
+ use style::values::KeyframesName;
+ 
+ #[dom_struct]
+@@ -77,23 +78,24 @@ impl CSSKeyframesRule {
+ impl CSSKeyframesRuleMethods for CSSKeyframesRule {
+     // https://drafts.csswg.org/css-animations/#dom-csskeyframesrule-cssrules
+     fn CssRules(&self) -> Root<CSSRuleList> {
+         self.rulelist()
+     }
+ 
+     // https://drafts.csswg.org/css-animations/#dom-csskeyframesrule-appendrule
+     fn AppendRule(&self, rule: DOMString) {
++        let doc = &*self.cssrule.parent_stylesheet().owner().upcast::<Node>().owner_doc();
+         let style_stylesheet = self.cssrule.parent_stylesheet().style_stylesheet();
+         let rule = Keyframe::parse(
+             &rule,
+             &style_stylesheet.contents,
+-            &style_stylesheet.shared_lock
++            &style_stylesheet.shared_lock,
++            doc.registered_property_set()
+         );
+-
+         if let Ok(rule) = rule {
+             let mut guard = self.cssrule.shared_lock().write();
+             self.keyframesrule.write_with(&mut guard).keyframes.push(rule);
+             self.rulelist().append_lazy_dom_rule();
+         }
+     }
+ 
+     // https://drafts.csswg.org/css-animations/#dom-csskeyframesrule-deleterule
+diff -r f1007237a8b4 components/script/dom/cssmediarule.rs
+--- a/components/script/dom/cssmediarule.rs	Mon Jul 10 11:33:04 2017 -0700
++++ b/components/script/dom/cssmediarule.rs	Tue Jul 11 20:25:08 2017 -0700
+@@ -70,19 +70,23 @@ impl CSSMediaRule {
+     /// https://drafts.csswg.org/css-conditional-3/#the-cssmediarule-interface
+     pub fn set_condition_text(&self, text: DOMString) {
+         let mut input = ParserInput::new(&text);
+         let mut input = Parser::new(&mut input);
+         let global = self.global();
+         let win = global.as_window();
+         let url = win.get_url();
+         let quirks_mode = win.Document().quirks_mode();
++
++        // We don't care about the set of registered custom properties here,
++        // according to the spec.
++        // https://drafts.css-houdini.org/css-properties-values-api-1/#conditional-rules
+         let context = ParserContext::new_for_cssom(&url, win.css_error_reporter(), Some(CssRuleType::Media),
+                                                    PARSING_MODE_DEFAULT,
+-                                                   quirks_mode);
++                                                   quirks_mode, /* registeredPropertySet */ None);
+         let new_medialist = parse_media_query_list(&context, &mut input);
+         let mut guard = self.cssconditionrule.shared_lock().write();
+ 
+         // Clone an Arc because we can’t borrow `guard` twice at the same time.
+ 
+         // FIXME(SimonSapin): allow access to multiple objects with one write guard?
+         // Would need a set of usize pointer addresses or something,
+         // the same object is not accessed more than once.
+diff -r f1007237a8b4 components/script/dom/cssrulelist.rs
+--- a/components/script/dom/cssrulelist.rs	Mon Jul 10 11:33:04 2017 -0700
++++ b/components/script/dom/cssrulelist.rs	Tue Jul 11 20:25:08 2017 -0700
+@@ -1,15 +1,16 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ use dom::bindings::cell::DOMRefCell;
+ use dom::bindings::codegen::Bindings::CSSRuleListBinding;
+ use dom::bindings::codegen::Bindings::CSSRuleListBinding::CSSRuleListMethods;
++use dom::bindings::codegen::Bindings::WindowBinding::WindowBinding::WindowMethods;
+ use dom::bindings::error::{Error, ErrorResult, Fallible};
+ use dom::bindings::js::{JS, MutNullableJS, Root};
+ use dom::bindings::reflector::{DomObject, Reflector, reflect_dom_object};
+ use dom::csskeyframerule::CSSKeyframeRule;
+ use dom::cssrule::CSSRule;
+ use dom::cssstylesheet::CSSStyleSheet;
+ use dom::window::Window;
+ use dom_struct::dom_struct;
+@@ -91,17 +92,18 @@ impl CSSRuleList {
+ 
+         let parent_stylesheet = self.parent_stylesheet.style_stylesheet();
+         let new_rule =
+             css_rules.insert_rule(&parent_stylesheet.shared_lock,
+                                   rule,
+                                   &parent_stylesheet.contents,
+                                   index,
+                                   nested,
+-                                  None)?;
++                                  None,
++                                  window.Document().registered_property_set())?;
+ 
+         let parent_stylesheet = &*self.parent_stylesheet;
+         let dom_rule = CSSRule::new_specific(&window, parent_stylesheet, new_rule);
+         self.dom_rules.borrow_mut().insert(index, MutNullableJS::new(Some(&*dom_rule)));
+         Ok((idx))
+     }
+ 
+     // In case of a keyframe rule, index must be valid.
+diff -r f1007237a8b4 components/script/dom/cssstyledeclaration.rs
+--- a/components/script/dom/cssstyledeclaration.rs	Mon Jul 10 11:33:04 2017 -0700
++++ b/components/script/dom/cssstyledeclaration.rs	Tue Jul 11 20:25:08 2017 -0700
+@@ -11,16 +11,17 @@ use dom::bindings::reflector::{DomObject
+ use dom::bindings::str::DOMString;
+ use dom::cssrule::CSSRule;
+ use dom::element::Element;
+ use dom::node::{Node, window_from_node, document_from_node};
+ use dom::window::Window;
+ use dom_struct::dom_struct;
+ use servo_url::ServoUrl;
+ use std::ascii::AsciiExt;
++
+ use style::attr::AttrValue;
+ use style::properties::{Importance, PropertyDeclarationBlock, PropertyId, LonghandId, ShorthandId};
+ use style::properties::{parse_one_declaration_into, parse_style_attribute, SourcePropertyDeclaration};
+ use style::selector_parser::PseudoElement;
+ use style::shared_lock::Locked;
+ use style::stylearc::Arc;
+ use style_traits::{PARSING_MODE_DEFAULT, ToCss};
+ 
+@@ -56,25 +57,28 @@ impl CSSStyleOwner {
+             CSSStyleOwner::Element(ref el) => {
+                 let document = document_from_node(&**el);
+                 let shared_lock = document.style_shared_lock();
+                 let mut attr = el.style_attribute().borrow_mut().take();
+                 let result = if attr.is_some() {
+                     let lock = attr.as_ref().unwrap();
+                     let mut guard = shared_lock.write();
+                     let mut pdb = lock.write_with(&mut guard);
++                    pdb.recompute_validities(document.quirks_mode());
+                     let result = f(&mut pdb, &mut changed);
+                     result
+                 } else {
+-                    let mut pdb = PropertyDeclarationBlock::new();
++                    let mut pdb = PropertyDeclarationBlock::new(
++                        Some(document.registered_property_set())
++                    );
+                     let result = f(&mut pdb, &mut changed);
+ 
+                     // Here `changed` is somewhat silly, because we know the
+                     // exact conditions under it changes.
+-                    changed = !pdb.declarations().is_empty();
++                    changed = pdb.declarations().next().is_some();
+                     if changed {
+                         attr = Some(Arc::new(shared_lock.wrap(pdb)));
+                     }
+ 
+                     result
+                 };
+ 
+                 if changed {
+@@ -111,24 +115,26 @@ impl CSSStyleOwner {
+         }
+     }
+ 
+     fn with_block<F, R>(&self, f: F) -> R
+         where F: FnOnce(&PropertyDeclarationBlock) -> R,
+     {
+         match *self {
+             CSSStyleOwner::Element(ref el) => {
++                let document = document_from_node(&**el);
+                 match *el.style_attribute().borrow() {
+                     Some(ref pdb) => {
+-                        let document = document_from_node(&**el);
+-                        let guard = document.style_shared_lock().read();
+-                        f(pdb.read_with(&guard))
++                        let mut guard = document.style_shared_lock().write();
++                        let pdb = pdb.write_with(&mut guard);
++                        pdb.recompute_validities(document.quirks_mode());
++                        f(pdb)
+                     }
+                     None => {
+-                        let pdb = PropertyDeclarationBlock::new();
++                        let pdb = PropertyDeclarationBlock::new(None);
+                         f(&pdb)
+                     }
+                 }
+             }
+             CSSStyleOwner::CSSRule(ref rule, ref pdb) => {
+                 let guard = rule.shared_lock().read();
+                 f(pdb.read_with(&guard))
+             }
+@@ -278,17 +284,17 @@ impl CSSStyleDeclaration {
+         })
+     }
+ }
+ 
+ impl CSSStyleDeclarationMethods for CSSStyleDeclaration {
+     // https://dev.w3.org/csswg/cssom/#dom-cssstyledeclaration-length
+     fn Length(&self) -> u32 {
+         self.owner.with_block(|pdb| {
+-            pdb.declarations().len() as u32
++            pdb.declarations().count() as u32
+         })
+     }
+ 
+     // https://dev.w3.org/csswg/cssom/#dom-cssstyledeclaration-item
+     fn Item(&self, index: u32) -> DOMString {
+         self.IndexedGetter(index).unwrap_or_default()
+     }
+ 
+@@ -403,17 +409,17 @@ impl CSSStyleDeclarationMethods for CSSS
+     // https://dev.w3.org/csswg/cssom/#dom-cssstyledeclaration-cssfloat
+     fn SetCssFloat(&self, value: DOMString) -> ErrorResult {
+         self.SetPropertyValue(DOMString::from("float"), value)
+     }
+ 
+     // https://dev.w3.org/csswg/cssom/#the-cssstyledeclaration-interface
+     fn IndexedGetter(&self, index: u32) -> Option<DOMString> {
+         self.owner.with_block(|pdb| {
+-            pdb.declarations().get(index as usize).map(|entry| {
++            pdb.declarations().nth(index as usize).map(|entry| {
+                 let (ref declaration, importance) = *entry;
+                 let mut css = declaration.to_css_string();
+                 if importance.important() {
+                     css += " !important";
+                 }
+                 DOMString::from(css)
+             })
+         })
+@@ -436,17 +442,18 @@ impl CSSStyleDeclarationMethods for CSSS
+         }
+ 
+         let quirks_mode = window.Document().quirks_mode();
+         self.owner.mutate_associated_block(|mut pdb, mut _changed| {
+             // Step 3
+             *pdb = parse_style_attribute(&value,
+                                          &self.owner.base_url(),
+                                          window.css_error_reporter(),
+-                                         quirks_mode);
++                                         quirks_mode,
++                                         window.Document().registered_property_set());
+         });
+ 
+         Ok(())
+     }
+ 
+     // https://drafts.csswg.org/cssom/#dom-cssstyledeclaration-_camel_cased_attribute
+     css_properties_accessors!(css_properties);
+ }
+diff -r f1007237a8b4 components/script/dom/cssstylesheet.rs
+--- a/components/script/dom/cssstylesheet.rs	Mon Jul 10 11:33:04 2017 -0700
++++ b/components/script/dom/cssstylesheet.rs	Tue Jul 11 20:25:08 2017 -0700
+@@ -1,17 +1,17 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ use dom::bindings::codegen::Bindings::CSSStyleSheetBinding;
+ use dom::bindings::codegen::Bindings::CSSStyleSheetBinding::CSSStyleSheetMethods;
+ use dom::bindings::codegen::Bindings::WindowBinding::WindowBinding::WindowMethods;
+ use dom::bindings::error::{Error, ErrorResult, Fallible};
+-use dom::bindings::js::{JS, MutNullableJS, Root};
++use dom::bindings::js::{JS, MutNullableJS, Root, RootedReference};
+ use dom::bindings::reflector::{reflect_dom_object, DomObject};
+ use dom::bindings::str::DOMString;
+ use dom::cssrulelist::{CSSRuleList, RulesSource};
+ use dom::element::Element;
+ use dom::stylesheet::StyleSheet;
+ use dom::window::Window;
+ use dom_struct::dom_struct;
+ use std::cell::Cell;
+@@ -83,16 +83,20 @@ impl CSSStyleSheet {
+ 
+     pub fn style_stylesheet(&self) -> &StyleStyleSheet {
+         &self.style_stylesheet
+     }
+ 
+     pub fn set_origin_clean(&self, origin_clean: bool) {
+         self.origin_clean.set(origin_clean);
+     }
++
++    pub fn owner(&self) -> &Element {
++        self.owner.r()
++    }
+ }
+ 
+ impl CSSStyleSheetMethods for CSSStyleSheet {
+     // https://drafts.csswg.org/cssom/#dom-cssstylesheet-cssrules
+     fn GetCssRules(&self) -> Fallible<Root<CSSRuleList>> {
+         if !self.origin_clean.get() {
+             return Err(Error::Security);
+         }
+diff -r f1007237a8b4 components/script/dom/csssupportsrule.rs
+--- a/components/script/dom/csssupportsrule.rs	Mon Jul 10 11:33:04 2017 -0700
++++ b/components/script/dom/csssupportsrule.rs	Tue Jul 11 20:25:08 2017 -0700
+@@ -58,19 +58,23 @@ impl CSSSupportsRule {
+         let mut input = ParserInput::new(&text);
+         let mut input = Parser::new(&mut input);
+         let cond = SupportsCondition::parse(&mut input);
+         if let Ok(cond) = cond {
+             let global = self.global();
+             let win = global.as_window();
+             let url = win.Document().url();
+             let quirks_mode = win.Document().quirks_mode();
++            // We don't care about the set of registered custom properties here,
++            // according to the spec.
++            // https://drafts.css-houdini.org/css-properties-values-api-1/#conditional-rules
+             let context = ParserContext::new_for_cssom(&url, win.css_error_reporter(), Some(CssRuleType::Supports),
+                                                        PARSING_MODE_DEFAULT,
+-                                                       quirks_mode);
++                                                       quirks_mode,
++                                                       /* registeredPropertySet */ None);
+             let enabled = cond.eval(&context);
+             let mut guard = self.cssconditionrule.shared_lock().write();
+             let rule = self.supportsrule.write_with(&mut guard);
+             rule.condition = cond;
+             rule.enabled = enabled;
+         }
+     }
+ }
+diff -r f1007237a8b4 components/script/dom/document.rs
+--- a/components/script/dom/document.rs	Mon Jul 10 11:33:04 2017 -0700
++++ b/components/script/dom/document.rs	Tue Jul 11 20:25:08 2017 -0700
+@@ -2318,30 +2329,46 @@ impl Document {
+                              .filter(|node| callback(&node));
+         NodeList::new_simple_list(&self.window, iter)
+     }
+ 
+     fn get_html_element(&self) -> Option<Root<HTMLHtmlElement>> {
+         self.GetDocumentElement().and_then(Root::downcast)
+     }
+ 
+-    // Ensure that the stylesheets vector is populated
++    // Ensure that the stylesheets vector is populated, and recompute
++    // declaration validities.
+     fn ensure_stylesheets(&self) {
+         let mut stylesheets = self.stylesheets.borrow_mut();
+         if stylesheets.is_none() {
++            // Populate self.stylesheets.
+             *stylesheets = Some(self.upcast::<Node>()
+                 .traverse_preorder()
+                 .filter_map(|node| {
+                     node.get_stylesheet()
+                         .map(|stylesheet| StylesheetInDocument {
+-                        node: JS::from_ref(&*node),
+-                        stylesheet: stylesheet,
+-                    })
++                            node: JS::from_ref(&*node),
++                            stylesheet: stylesheet,
++                        })
+                 })
+                 .collect());
++
++            // Recompute declaration validities.
++            let mut pdbs = Vec::new();
++            {
++                let guard = self.style_shared_lock.read();
++                for stylesheet in stylesheets.as_ref().unwrap() {
++                    stylesheet.stylesheet.contents.rules
++                              .append_property_declaration_blocks(&guard, &mut pdbs);
++                }
++            }
++            let mut guard = self.style_shared_lock.write();
++            for pdb in pdbs {
++                pdb.write_with(&mut guard).recompute_validities(self.quirks_mode.get());
++            }
+         };
+     }
+ 
+     /// Return a reference to the per-document shared lock used in stylesheets.
+     pub fn style_shared_lock(&self) -> &StyleSharedRwLock {
+         &self.style_shared_lock
+     }
+ 
+diff -r f1007237a8b4 components/script/dom/htmllinkelement.rs
+--- a/components/script/dom/htmllinkelement.rs	Mon Jul 10 11:33:04 2017 -0700
++++ b/components/script/dom/htmllinkelement.rs	Tue Jul 11 20:25:08 2017 -0700
+@@ -280,17 +280,18 @@ impl HTMLLinkElement {
+         };
+ 
+         let mut input = ParserInput::new(&mq_str);
+         let mut css_parser = CssParser::new(&mut input);
+         let win = document.window();
+         let doc_url = document.url();
+         let context = CssParserContext::new_for_cssom(&doc_url, win.css_error_reporter(), Some(CssRuleType::Media),
+                                                       PARSING_MODE_DEFAULT,
+-                                                      document.quirks_mode());
++                                                      document.quirks_mode(),
++                                                      Some(document.registered_property_set()));
+         let media = parse_media_query_list(&context, &mut css_parser);
+ 
+         let im_attribute = element.get_attribute(&ns!(), &local_name!("integrity"));
+         let integrity_val = im_attribute.r().map(|a| a.value());
+         let integrity_metadata = match integrity_val {
+             Some(ref value) => &***value,
+             None => "",
+         };
+diff -r f1007237a8b4 components/script/dom/htmlstyleelement.rs
+--- a/components/script/dom/htmlstyleelement.rs	Mon Jul 10 11:33:04 2017 -0700
++++ b/components/script/dom/htmlstyleelement.rs	Tue Jul 11 20:25:08 2017 -0700
+@@ -85,27 +85,29 @@ impl HTMLStyleElement {
+         };
+ 
+         let data = node.GetTextContent().expect("Element.textContent must be a string");
+         let url = win.get_url();
+         let context = CssParserContext::new_for_cssom(&url,
+                                                       win.css_error_reporter(),
+                                                       Some(CssRuleType::Media),
+                                                       PARSING_MODE_DEFAULT,
+-                                                      doc.quirks_mode());
++                                                      doc.quirks_mode(),
++                                                      Some(doc.registered_property_set()));
+         let shared_lock = node.owner_doc().style_shared_lock().clone();
+         let mut input = ParserInput::new(&mq_str);
+         let mq = Arc::new(shared_lock.wrap(
+                     parse_media_query_list(&context, &mut CssParser::new(&mut input))));
+         let loader = StylesheetLoader::for_element(self.upcast());
+         let sheet = Stylesheet::from_str(&data, win.get_url(), Origin::Author, mq,
+                                          shared_lock, Some(&loader),
+                                          win.css_error_reporter(),
+                                          doc.quirks_mode(),
+-                                         self.line_number);
++                                         self.line_number,
++                                         Some(doc.registered_property_set()));
+ 
+         let sheet = Arc::new(sheet);
+ 
+         // No subresource loads were triggered, just fire the load event now.
+         if self.pending_loads.get() == 0 {
+             self.upcast::<EventTarget>().fire_event(atom!("load"));
+         }
+ 
+diff -r f1007237a8b4 components/script/dom/medialist.rs
+--- a/components/script/dom/medialist.rs	Mon Jul 10 11:33:04 2017 -0700
++++ b/components/script/dom/medialist.rs	Tue Jul 11 20:25:08 2017 -0700
+@@ -74,17 +74,18 @@ impl MediaListMethods for MediaList {
+         let mut input = ParserInput::new(&value);
+         let mut parser = Parser::new(&mut input);
+         let global = self.global();
+         let win = global.as_window();
+         let url = win.get_url();
+         let quirks_mode = win.Document().quirks_mode();
+         let context = ParserContext::new_for_cssom(&url, win.css_error_reporter(), Some(CssRuleType::Media),
+                                                    PARSING_MODE_DEFAULT,
+-                                                   quirks_mode);
++                                                   quirks_mode,
++                                                   /* registeredPropertySet */ None);
+         *media_queries = parse_media_query_list(&context, &mut parser);
+     }
+ 
+     // https://drafts.csswg.org/cssom/#dom-medialist-length
+     fn Length(&self) -> u32 {
+         let guard = self.shared_lock().read();
+         self.media_queries.read_with(&guard).media_queries.len() as u32
+     }
+@@ -111,17 +112,17 @@ impl MediaListMethods for MediaList {
+         let mut input = ParserInput::new(&medium);
+         let mut parser = Parser::new(&mut input);
+         let global = self.global();
+         let win = global.as_window();
+         let url = win.get_url();
+         let quirks_mode = win.Document().quirks_mode();
+         let context = ParserContext::new_for_cssom(&url, win.css_error_reporter(), Some(CssRuleType::Media),
+                                                    PARSING_MODE_DEFAULT,
+-                                                   quirks_mode);
++                                                   quirks_mode, /* registeredPropertySet */ None);
+         let m = MediaQuery::parse(&context, &mut parser);
+         // Step 2
+         if let Err(_) = m {
+             return;
+         }
+         // Step 3
+         let m_serialized = m.clone().unwrap().to_css_string();
+         let mut guard = self.shared_lock().write();
+@@ -140,17 +141,17 @@ impl MediaListMethods for MediaList {
+         let mut input = ParserInput::new(&medium);
+         let mut parser = Parser::new(&mut input);
+         let global = self.global();
+         let win = global.as_window();
+         let url = win.get_url();
+         let quirks_mode = win.Document().quirks_mode();
+         let context = ParserContext::new_for_cssom(&url, win.css_error_reporter(), Some(CssRuleType::Media),
+                                                    PARSING_MODE_DEFAULT,
+-                                                   quirks_mode);
++                                                   quirks_mode, /* registeredPropertySet */ None);
+         let m = MediaQuery::parse(&context, &mut parser);
+         // Step 2
+         if let Err(_) = m {
+             return;
+         }
+         // Step 3
+         let m_serialized = m.unwrap().to_css_string();
+         let mut guard = self.shared_lock().write();
+diff -r f1007237a8b4 components/script/dom/window.rs
+--- a/components/script/dom/window.rs	Mon Jul 10 11:33:04 2017 -0700
++++ b/components/script/dom/window.rs	Tue Jul 11 20:25:08 2017 -0700
+@@ -1006,17 +1006,18 @@ impl WindowMethods for Window {
+     // https://drafts.csswg.org/cssom-view/#dom-window-matchmedia
+     fn MatchMedia(&self, query: DOMString) -> Root<MediaQueryList> {
+         let mut input = ParserInput::new(&query);
+         let mut parser = Parser::new(&mut input);
+         let url = self.get_url();
+         let quirks_mode = self.Document().quirks_mode();
+         let context = CssParserContext::new_for_cssom(&url, self.css_error_reporter(), Some(CssRuleType::Media),
+                                                       PARSING_MODE_DEFAULT,
+-                                                      quirks_mode);
++                                                      quirks_mode,
++                                                      /* registeredPropertySet */ None);
+         let media_query_list = media_queries::parse_media_query_list(&context, &mut parser);
+         let document = self.Document();
+         let mql = MediaQueryList::new(&document, media_query_list);
+         self.media_query_lists.push(&*mql);
+         mql
+     }
+ 
+     #[allow(unrooted_must_root)]
+diff -r f1007237a8b4 components/script/stylesheet_loader.rs
+--- a/components/script/stylesheet_loader.rs	Mon Jul 10 11:33:04 2017 -0700
++++ b/components/script/stylesheet_loader.rs	Tue Jul 11 20:25:08 2017 -0700
+@@ -147,33 +147,35 @@ impl FetchResponseListener for Styleshee
+                             Arc::new(Stylesheet::from_bytes(&data, final_url,
+                                                             protocol_encoding_label,
+                                                             Some(environment_encoding),
+                                                             Origin::Author,
+                                                             media.take().unwrap(),
+                                                             shared_lock,
+                                                             Some(&loader),
+                                                             win.css_error_reporter(),
+-                                                            document.quirks_mode()));
++                                                            document.quirks_mode(),
++                                                            Some(document.registered_property_set())));
+ 
+                         if link.is_alternate() {
+                             sheet.set_disabled(true);
+                         }
+ 
+                         link.set_stylesheet(sheet);
+                     }
+                 }
+                 StylesheetContextSource::Import(ref stylesheet) => {
+                     Stylesheet::update_from_bytes(&stylesheet,
+                                                   &data,
+                                                   protocol_encoding_label,
+                                                   Some(environment_encoding),
+                                                   final_url,
+                                                   Some(&loader),
+-                                                  win.css_error_reporter());
++                                                  win.css_error_reporter(),
++                                                  Some(document.registered_property_set()));
+                 }
+             }
+ 
+             document.invalidate_stylesheets();
+ 
+             // FIXME: Revisit once consensus is reached at:
+             // https://github.com/whatwg/html/issues/1142
+             successful = metadata.status.map_or(false, |(code, _)| code == 200);
+diff -r f1007237a8b4 components/style/animation.rs
+--- a/components/style/animation.rs	Mon Jul 10 11:33:04 2017 -0700
++++ b/components/style/animation.rs	Tue Jul 11 20:25:08 2017 -0700
+@@ -485,21 +485,21 @@ fn compute_style_for_animation_step(cont
+                                     font_metrics_provider: &FontMetricsProvider)
+                                     -> ComputedValues {
+     match step.value {
+         KeyframesStepValue::ComputedValues => style_from_cascade.clone(),
+         KeyframesStepValue::Declarations { block: ref declarations } => {
+             let guard = declarations.read_with(context.guards.author);
+ 
+             // No !important in keyframes.
+-            debug_assert!(guard.declarations().iter()
++            debug_assert!(guard.declarations()
+                             .all(|&(_, importance)| importance == Importance::Normal));
+ 
+             let iter = || {
+-                guard.declarations().iter().rev()
++                guard.declarations().rev()
+                      .map(|&(ref decl, _importance)| (decl, CascadeLevel::Animations))
+             };
+ 
+             // This currently ignores visited styles, which seems acceptable,
+             // as existing browsers don't appear to animate visited styles.
+             let computed =
+                 properties::apply_declarations(context.stylist.device(),
+                                                previous_style.rules(),
+diff -r f1007237a8b4 tests/unit/style/keyframes.rs
+--- a/tests/unit/style/keyframes.rs	Mon Jul 10 11:33:04 2017 -0700
++++ b/tests/unit/style/keyframes.rs	Tue Jul 11 20:25:08 2017 -0700
+@@ -27,17 +27,17 @@ fn test_empty_keyframe() {
+ }
+ 
+ #[test]
+ fn test_no_property_in_keyframe() {
+     let shared_lock = SharedRwLock::new();
+     let keyframes = vec![
+         Arc::new(shared_lock.wrap(Keyframe {
+             selector: KeyframeSelector::new_for_unit_testing(vec![KeyframePercentage::new(1.)]),
+-            block: Arc::new(shared_lock.wrap(PropertyDeclarationBlock::new()))
++            block: Arc::new(shared_lock.wrap(PropertyDeclarationBlock::new(None)))
+         })),
+     ];
+     let animation = KeyframesAnimation::from_keyframes(&keyframes,
+                                                        /* vendor_prefix = */ None,
+                                                        &shared_lock.read());
+     let expected = KeyframesAnimation {
+         steps: vec![],
+         properties_changed: vec![],
+@@ -54,17 +54,17 @@ fn test_missing_property_in_initial_keyf
+         Arc::new(shared_lock.wrap(PropertyDeclarationBlock::with_one(
+             PropertyDeclaration::Width(
+                 LengthOrPercentageOrAuto::Length(NoCalcLength::from_px(20f32))),
+             Importance::Normal
+         )));
+ 
+     let declarations_on_final_keyframe =
+         Arc::new(shared_lock.wrap({
+-            let mut block = PropertyDeclarationBlock::new();
++            let mut block = PropertyDeclarationBlock::new(None);
+             block.push(
+                 PropertyDeclaration::Width(
+                     LengthOrPercentageOrAuto::Length(NoCalcLength::from_px(20f32))),
+                 Importance::Normal
+             );
+             block.push(
+                 PropertyDeclaration::Height(
+                     LengthOrPercentageOrAuto::Length(NoCalcLength::from_px(20f32))),
+@@ -107,17 +107,17 @@ fn test_missing_property_in_initial_keyf
+     assert_eq!(format!("{:#?}", animation), format!("{:#?}", expected));
+ }
+ 
+ #[test]
+ fn test_missing_property_in_final_keyframe() {
+     let shared_lock = SharedRwLock::new();
+     let declarations_on_initial_keyframe =
+         Arc::new(shared_lock.wrap({
+-            let mut block = PropertyDeclarationBlock::new();
++            let mut block = PropertyDeclarationBlock::new(None);
+             block.push(
+                 PropertyDeclaration::Width(
+                     LengthOrPercentageOrAuto::Length(NoCalcLength::from_px(20f32))),
+                 Importance::Normal
+             );
+             block.push(
+                 PropertyDeclaration::Height(
+                     LengthOrPercentageOrAuto::Length(NoCalcLength::from_px(20f32))),
+@@ -167,51 +167,51 @@ fn test_missing_property_in_final_keyfra
+     assert_eq!(format!("{:#?}", animation), format!("{:#?}", expected));
+ }
+ 
+ #[test]
+ fn test_missing_keyframe_in_both_of_initial_and_final_keyframe() {
+     let shared_lock = SharedRwLock::new();
+     let declarations =
+         Arc::new(shared_lock.wrap({
+-            let mut block = PropertyDeclarationBlock::new();
++            let mut block = PropertyDeclarationBlock::new(None);
+             block.push(
+                 PropertyDeclaration::Width(
+                     LengthOrPercentageOrAuto::Length(NoCalcLength::from_px(20f32))),
+                 Importance::Normal
+             );
+             block.push(
+                 PropertyDeclaration::Height(
+                     LengthOrPercentageOrAuto::Length(NoCalcLength::from_px(20f32))),
+                 Importance::Normal
+             );
+             block
+         }));
+ 
+     let keyframes = vec![
+         Arc::new(shared_lock.wrap(Keyframe {
+             selector: KeyframeSelector::new_for_unit_testing(vec![KeyframePercentage::new(0.)]),
+-            block: Arc::new(shared_lock.wrap(PropertyDeclarationBlock::new()))
++            block: Arc::new(shared_lock.wrap(PropertyDeclarationBlock::new(None)))
+         })),
+         Arc::new(shared_lock.wrap(Keyframe {
+             selector: KeyframeSelector::new_for_unit_testing(vec![KeyframePercentage::new(0.5)]),
+             block: declarations.clone(),
+         })),
+     ];
+     let animation = KeyframesAnimation::from_keyframes(&keyframes,
+                                                        /* vendor_prefix = */ None,
+                                                        &shared_lock.read());
+     let expected = KeyframesAnimation {
+         steps: vec![
+             KeyframesStep {
+                 start_percentage: KeyframePercentage(0.),
+                 value: KeyframesStepValue::Declarations {
+                     block: Arc::new(shared_lock.wrap(
+                         // XXX: Should we use ComputedValues in this case?
+-                        PropertyDeclarationBlock::new()
++                        PropertyDeclarationBlock::new(None)
+                     ))
+                 },
+                 declared_timing_function: false,
+             },
+             KeyframesStep {
+                 start_percentage: KeyframePercentage(0.5),
+                 value: KeyframesStepValue::Declarations { block: declarations },
+                 declared_timing_function: false,
+diff -r f1007237a8b4 tests/unit/style/media_queries.rs
+--- a/tests/unit/style/media_queries.rs	Mon Jul 10 11:33:04 2017 -0700
++++ b/tests/unit/style/media_queries.rs	Tue Jul 11 20:25:08 2017 -0700
+@@ -33,17 +33,18 @@ fn test_media_rule<F>(css: &str, callbac
+     where F: Fn(&MediaList, &str),
+ {
+     let url = ServoUrl::parse("http://localhost").unwrap();
+     let css_str = css.to_owned();
+     let lock = SharedRwLock::new();
+     let media_list = Arc::new(lock.wrap(MediaList::empty()));
+     let stylesheet = Stylesheet::from_str(
+         css, url, Origin::Author, media_list, lock,
+-        None, &CSSErrorReporterTest, QuirksMode::NoQuirks, 0u64);
++        None, &CSSErrorReporterTest, QuirksMode::NoQuirks, 0u64,
++        /* registeredPropertySet */ None);
+     let dummy = Device::new(MediaType::Screen, TypedSize2D::new(200.0, 100.0));
+     let mut rule_count = 0;
+     let guard = stylesheet.shared_lock.read();
+     for rule in stylesheet.iter_rules::<AllRules>(&dummy, &guard) {
+         if let CssRule::Media(ref lock) = *rule {
+             rule_count += 1;
+             callback(&lock.read_with(&guard).media_queries.read_with(&guard), css);
+         }
+@@ -52,17 +53,18 @@ fn test_media_rule<F>(css: &str, callbac
+ }
+ 
+ fn media_query_test(device: &Device, css: &str, expected_rule_count: usize) {
+     let url = ServoUrl::parse("http://localhost").unwrap();
+     let lock = SharedRwLock::new();
+     let media_list = Arc::new(lock.wrap(MediaList::empty()));
+     let ss = Stylesheet::from_str(
+         css, url, Origin::Author, media_list, lock,
+-        None, &CSSErrorReporterTest, QuirksMode::NoQuirks, 0u64);
++        None, &CSSErrorReporterTest, QuirksMode::NoQuirks, 0u64,
++        /* registeredPropertySet */ None);
+     let mut rule_count = 0;
+     ss.effective_style_rules(device, &ss.shared_lock.read(), |_| rule_count += 1);
+     assert!(rule_count == expected_rule_count, css.to_owned());
+ }
+ 
+ #[test]
+ fn test_mq_empty() {
+     test_media_rule("@media { }", |list, css| {
+diff -r f1007237a8b4 tests/unit/style/parsing/length.rs
+--- a/tests/unit/style/parsing/length.rs	Mon Jul 10 11:33:04 2017 -0700
++++ b/tests/unit/style/parsing/length.rs	Tue Jul 11 20:25:08 2017 -0700
+@@ -39,17 +39,17 @@ fn test_parsing_modes() {
+     // In default length mode, non-zero lengths must have a unit.
+     assert!(parse(Length::parse, "1").is_err());
+ 
+     // In SVG length mode, non-zero lengths are assumed to be px.
+     let url = ::servo_url::ServoUrl::parse("http://localhost").unwrap();
+     let reporter = CSSErrorReporterTest;
+     let context = ParserContext::new(Origin::Author, &url, &reporter,
+                                      Some(CssRuleType::Style), PARSING_MODE_ALLOW_UNITLESS_LENGTH,
+-                                     QuirksMode::NoQuirks);
++                                     QuirksMode::NoQuirks, /* registeredPropertySet */ None);
+     let mut input = ParserInput::new("1");
+     let mut parser = Parser::new(&mut input);
+     let result = Length::parse(&context, &mut parser);
+     assert!(result.is_ok());
+     assert_eq!(result.unwrap(), Length::NoCalc(NoCalcLength::Absolute(AbsoluteLength::Px(1.))));
+ }
+ 
+ #[test]
+diff -r f1007237a8b4 tests/unit/style/parsing/mod.rs
+--- a/tests/unit/style/parsing/mod.rs	Mon Jul 10 11:33:04 2017 -0700
++++ b/tests/unit/style/parsing/mod.rs	Tue Jul 11 20:25:08 2017 -0700
+@@ -23,17 +23,17 @@ where F: for<'t> Fn(&ParserContext, &mut
+ }
+ 
+ fn parse_input<'i: 't, 't, T, F>(f: F, input: &'t mut ParserInput<'i>) -> Result<T, ParseError<'i>>
+ where F: Fn(&ParserContext, &mut Parser<'i, 't>) -> Result<T, ParseError<'i>> {
+     let url = ::servo_url::ServoUrl::parse("http://localhost").unwrap();
+     let reporter = CSSErrorReporterTest;
+     let context = ParserContext::new(Origin::Author, &url, &reporter, Some(CssRuleType::Style),
+                                      PARSING_MODE_DEFAULT,
+-                                     QuirksMode::NoQuirks);
++                                     QuirksMode::NoQuirks, /* registeredPropertySet */ None);
+     let mut parser = Parser::new(input);
+     f(&context, &mut parser)
+ }
+ 
+ fn parse_entirely<T, F>(f: F, s: &'static str) -> Result<T, ParseError<'static>>
+ where F: for<'t> Fn(&ParserContext, &mut Parser<'static, 't>) -> Result<T, ParseError<'static>> {
+     let mut input = ParserInput::new(s);
+     parse_entirely_input(f, &mut input)
+diff -r f1007237a8b4 tests/unit/style/parsing/value.rs
+--- a/tests/unit/style/parsing/value.rs	Mon Jul 10 11:33:04 2017 -0700
++++ b/tests/unit/style/parsing/value.rs	Tue Jul 11 20:25:08 2017 -0700
+@@ -21,16 +21,17 @@ fn length_has_viewport_percentage() {
+ 
+ #[test]
+ fn test_parsing_allo_all_numeric_values() {
+     // In SVG length mode, non-zero lengths are assumed to be px.
+     let url = ::servo_url::ServoUrl::parse("http://localhost").unwrap();
+     let reporter = CSSErrorReporterTest;
+     let context = ParserContext::new(Origin::Author, &url, &reporter,
+                                      Some(CssRuleType::Style), PARSING_MODE_ALLOW_ALL_NUMERIC_VALUES,
+-                                     QuirksMode::NoQuirks);
++                                     QuirksMode::NoQuirks,
++                                     /* registeredPropertySet */ None);
+     let mut input = ParserInput::new("-1");
+     let mut parser = Parser::new(&mut input);
+     let result = Number::parse_non_negative(&context, &mut parser);
+     assert!(result.is_ok());
+     assert_eq!(result.unwrap(), Number::new(-1.));
+ }
+ 
+diff -r f1007237a8b4 tests/unit/style/properties/mod.rs
+--- a/tests/unit/style/properties/mod.rs	Mon Jul 10 11:33:04 2017 -0700
++++ b/tests/unit/style/properties/mod.rs	Tue Jul 11 20:25:08 2017 -0700
+@@ -16,17 +16,17 @@ where F: for<'t> Fn(&ParserContext, &mut
+ }
+ 
+ fn parse_input<'i: 't, 't, T, F>(f: F, input: &'t mut ParserInput<'i>) -> Result<T, ParseError<'i>>
+     where F: Fn(&ParserContext, &mut Parser<'i, 't>) -> Result<T, ParseError<'i>> {
+     let url = ::servo_url::ServoUrl::parse("http://localhost").unwrap();
+     let reporter = CSSErrorReporterTest;
+     let context = ParserContext::new(Origin::Author, &url, &reporter, Some(CssRuleType::Style),
+                                      PARSING_MODE_DEFAULT,
+-                                     QuirksMode::NoQuirks);
++                                     QuirksMode::NoQuirks, /* registeredPropertySet */ None);
+     let mut parser = Parser::new(input);
+     f(&context, &mut parser)
+ }
+ 
+ macro_rules! assert_roundtrip_with_context {
+     ($fun:expr, $string:expr) => {
+         assert_roundtrip_with_context!($fun, $string, $string);
+     };
+diff -r f1007237a8b4 tests/unit/style/rule_tree/bench.rs
+--- a/tests/unit/style/rule_tree/bench.rs	Mon Jul 10 11:33:04 2017 -0700
++++ b/tests/unit/style/rule_tree/bench.rs	Tue Jul 11 20:25:08 2017 -0700
+@@ -55,17 +55,18 @@ fn parse_rules(css: &str) -> Vec<(StyleS
+     let s = Stylesheet::from_str(css,
+                                  ServoUrl::parse("http://localhost").unwrap(),
+                                  Origin::Author,
+                                  media,
+                                  lock,
+                                  None,
+                                  &ErrorringErrorReporter,
+                                  QuirksMode::NoQuirks,
+-                                 0u64);
++                                 0u64,
++                                 /* registeredPropertySet */ Some(Default::default()));
+     let guard = s.shared_lock.read();
+     let rules = s.contents.rules.read_with(&guard);
+     rules.0.iter().filter_map(|rule| {
+         match *rule {
+             CssRule::Style(ref style_rule) => Some(style_rule),
+             _ => None,
+         }
+     }).cloned().map(StyleSource::Style).map(|s| {
+diff -r f1007237a8b4 tests/unit/style/stylesheets.rs
+--- a/tests/unit/style/stylesheets.rs	Mon Jul 10 11:33:04 2017 -0700
++++ b/tests/unit/style/stylesheets.rs	Tue Jul 11 20:25:08 2017 -0700
+@@ -25,17 +25,17 @@ use style::stylearc::Arc;
+ use style::stylesheets::{Origin, Namespaces};
+ use style::stylesheets::{Stylesheet, StylesheetContents, NamespaceRule, CssRule, CssRules, StyleRule, KeyframesRule};
+ use style::stylesheets::keyframes_rule::{Keyframe, KeyframeSelector, KeyframePercentage};
+ use style::values::{KeyframesName, CustomIdent};
+ use style::values::specified::{LengthOrPercentageOrAuto, Percentage, PositionComponent};
+ 
+ pub fn block_from<I>(iterable: I) -> PropertyDeclarationBlock
+ where I: IntoIterator<Item=(PropertyDeclaration, Importance)> {
+-    let mut block = PropertyDeclarationBlock::new();
++    let mut block = PropertyDeclarationBlock::new(Some(Default::default()));
+     for (d, i) in iterable {
+         block.push(d, i)
+     }
+     block
+ }
+ 
+ #[test]
+ fn test_parse_stylesheet() {
+@@ -63,17 +63,18 @@ fn test_parse_stylesheet() {
+                 animation-name: 'foo'; /* animation properties not allowed here */
+                 animation-play-state: running; /* … except animation-play-state */
+             }
+         }";
+     let url = ServoUrl::parse("about::test").unwrap();
+     let lock = SharedRwLock::new();
+     let media = Arc::new(lock.wrap(MediaList::empty()));
+     let stylesheet = Stylesheet::from_str(css, url.clone(), Origin::UserAgent, media, lock,
+-                                          None, &CSSErrorReporterTest, QuirksMode::NoQuirks, 0u64);
++                                          None, &CSSErrorReporterTest, QuirksMode::NoQuirks, 0u64,
++                                          /* registeredPropertySet */ Some(Default::default));
+     let mut namespaces = Namespaces::default();
+     namespaces.default = Some((ns!(html), ()));
+     let expected = Stylesheet {
+         contents: StylesheetContents {
+             origin: Origin::UserAgent,
+             namespaces: RwLock::new(namespaces),
+             url_data: RwLock::new(url),
+             dirty_on_viewport_size_change: AtomicBool::new(false),
+@@ -304,17 +305,18 @@ fn test_report_error_stylesheet() {
+     let url = ServoUrl::parse("about::test").unwrap();
+     let error_reporter = CSSInvalidErrorReporterTest::new();
+ 
+     let errors = error_reporter.errors.clone();
+ 
+     let lock = SharedRwLock::new();
+     let media = Arc::new(lock.wrap(MediaList::empty()));
+     Stylesheet::from_str(css, url.clone(), Origin::UserAgent, media, lock,
+-                         None, &error_reporter, QuirksMode::NoQuirks, 5u64);
++                         None, &error_reporter, QuirksMode::NoQuirks, 5u64,
++                         /* registeredPropertySet */ None);
+ 
+     let mut errors = errors.lock().unwrap();
+ 
+     let error = errors.pop().unwrap();
+     assert_eq!("Unsupported property declaration: 'invalid: true;', found unexpected identifier true", error.message);
+     assert_eq!(10, error.line);
+     assert_eq!(9, error.column);
+ 
+diff -r f1007237a8b4 tests/unit/style/viewport.rs
+--- a/tests/unit/style/viewport.rs	Mon Jul 10 11:33:04 2017 -0700
++++ b/tests/unit/style/viewport.rs	Tue Jul 11 20:25:08 2017 -0700
+@@ -29,17 +29,18 @@ macro_rules! stylesheet {
+             $css,
+             ServoUrl::parse("http://localhost").unwrap(),
+             Origin::$origin,
+             Arc::new($shared_lock.wrap(MediaList::empty())),
+             $shared_lock,
+             None,
+             &$error_reporter,
+             QuirksMode::NoQuirks,
+-            0u64
++            0u64,
++            /* registeredPropertySet */ Some(Default::default())
+         ))
+     }
+ }
+ 
+ fn test_viewport_rule<F>(css: &str,
+                          device: &Device,
+                          callback: F)
+     where F: Fn(&Vec<ViewportDescriptorDeclaration>, &str)
+@@ -299,17 +300,18 @@ fn multiple_stylesheets_cascading() {
+ }
+ 
+ #[test]
+ fn constrain_viewport() {
+     let url = ServoUrl::parse("http://localhost").unwrap();
+     let reporter = CSSErrorReporterTest;
+     let context = ParserContext::new(Origin::Author, &url, &reporter, Some(CssRuleType::Viewport),
+                                      PARSING_MODE_DEFAULT,
+-                                     QuirksMode::NoQuirks);
++                                     QuirksMode::NoQuirks,
++                                     /* registeredPropertySet */ None);
+ 
+     macro_rules! from_css {
+         ($css:expr) => {
+             &ViewportRule::parse(&context, &mut Parser::new(&mut $css)).unwrap()
+         }
+     }
+ 
+     let initial_viewport = TypedSize2D::new(800., 600.);

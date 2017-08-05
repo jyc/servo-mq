@@ -1,0 +1,4828 @@
+# HG changeset patch
+# Parent  5805d929bec9ae3921bced556fb457e3b9f82876
+
+diff -r 5805d929bec9 Cargo.lock
+--- a/Cargo.lock	Thu Jul 27 11:07:29 2017 -0500
++++ b/Cargo.lock	Thu Jul 27 13:21:13 2017 -0700
+@@ -3081,16 +3081,17 @@ dependencies = [
+  "app_units 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
+  "bitflags 0.7.0 (registry+https://github.com/rust-lang/crates.io-index)",
+  "cssparser 0.18.0 (registry+https://github.com/rust-lang/crates.io-index)",
+  "euclid 0.15.1 (registry+https://github.com/rust-lang/crates.io-index)",
+  "heapsize 0.4.0 (registry+https://github.com/rust-lang/crates.io-index)",
+  "heapsize_derive 0.1.4 (registry+https://github.com/rust-lang/crates.io-index)",
+  "selectors 0.19.0",
+  "serde 1.0.8 (registry+https://github.com/rust-lang/crates.io-index)",
++ "servo_atoms 0.0.1",
+ ]
+ 
+ [[package]]
+ name = "stylo_tests"
+ version = "0.0.1"
+ dependencies = [
+  "atomic_refcell 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
+  "cssparser 0.18.0 (registry+https://github.com/rust-lang/crates.io-index)",
+diff -r 5805d929bec9 components/layout_thread/dom_wrapper.rs
+--- a/components/layout_thread/dom_wrapper.rs	Thu Jul 27 11:07:29 2017 -0500
++++ b/components/layout_thread/dom_wrapper.rs	Thu Jul 27 13:21:13 2017 -0700
+@@ -33,16 +33,17 @@
+ use atomic_refcell::{AtomicRef, AtomicRefMut, AtomicRefCell};
+ use core::nonzero::NonZero;
+ use gfx_traits::ByteIndex;
+ use html5ever::{LocalName, Namespace};
+ use layout::data::StyleAndLayoutData;
+ use layout::wrapper::GetRawData;
+ use msg::constellation_msg::{BrowsingContextId, PipelineId};
+ use range::Range;
++use parking_lot::RwLock;
+ use script::layout_exports::{CAN_BE_FRAGMENTED, DIRTY_ON_VIEWPORT_SIZE_CHANGE, HAS_DIRTY_DESCENDANTS, IS_IN_DOC};
+ use script::layout_exports::{CharacterDataTypeId, ElementTypeId, HTMLElementTypeId, NodeTypeId};
+ use script::layout_exports::{Document, Element, Node, Text};
+ use script::layout_exports::{HANDLED_SNAPSHOT, HAS_SNAPSHOT};
+ use script::layout_exports::{LayoutCharacterDataHelpers, LayoutDocumentHelpers};
+ use script::layout_exports::{LayoutElementHelpers, LayoutNodeHelpers, RawLayoutElementHelpers};
+ use script::layout_exports::LayoutJS;
+ use script::layout_exports::PendingRestyle;
+@@ -70,16 +71,17 @@ use style::attr::AttrValue;
+ use style::computed_values::display;
+ use style::context::{QuirksMode, SharedStyleContext};
+ use style::data::ElementData;
+ use style::dom::{DescendantsBit, DirtyDescendants, LayoutIterator, NodeInfo, OpaqueNode};
+ use style::dom::{PresentationalHintsSynthesizer, TElement, TNode, UnsafeNode};
+ use style::element_state::*;
+ use style::font_metrics::ServoMetricsProvider;
+ use style::properties::{ComputedValues, PropertyDeclarationBlock};
++use style::properties_and_values::RegisteredPropertySet;
+ use style::selector_parser::{AttrValue as SelectorAttrValue, NonTSPseudoClass, PseudoClassStringArg};
+ use style::selector_parser::{PseudoElement, SelectorImpl, extended_filtering};
+ use style::shared_lock::{SharedRwLock as StyleSharedRwLock, Locked as StyleLocked};
+ use style::str::is_whitespace;
+ 
+ pub unsafe fn drop_style_and_layout_data(data: OpaqueStyleAndLayoutData) {
+     let ptr: *mut StyleData = data.ptr.get();
+     let non_opaque: *mut StyleAndLayoutData = ptr as *mut _;
+@@ -361,16 +363,20 @@ impl<'ld> ServoLayoutDocument<'ld> {
+     pub fn quirks_mode(&self) -> QuirksMode {
+         unsafe { self.document.quirks_mode() }
+     }
+ 
+     pub fn style_shared_lock(&self) -> &StyleSharedRwLock {
+         unsafe { self.document.style_shared_lock() }
+     }
+ 
++    pub fn registered_property_set(&self) -> Arc<RwLock<RegisteredPropertySet>> {
++        unsafe { self.document.registered_property_set() }
++    }
++
+     pub fn from_layout_js(doc: LayoutJS<Document>) -> ServoLayoutDocument<'ld> {
+         ServoLayoutDocument {
+             document: doc,
+             chain: PhantomData,
+         }
+     }
+ }
+ 
+diff -r 5805d929bec9 components/layout_thread/lib.rs
+--- a/components/layout_thread/lib.rs	Thu Jul 27 11:07:29 2017 -0500
++++ b/components/layout_thread/lib.rs	Thu Jul 27 13:21:13 2017 -0700
+@@ -1188,27 +1188,32 @@ impl LayoutThread {
+         let ua_or_user_guard = ua_stylesheets.shared_lock.read();
+         let guards = StylesheetGuards {
+             author: &author_guard,
+             ua_or_user: &ua_or_user_guard,
+         };
+         let mut extra_data = ExtraStyleData {
+             marker: PhantomData,
+         };
++        self.stylist.set_registered_property_set(document.registered_property_set());
+         let needs_dirtying = self.stylist.update(
+             StylesheetIterator(data.document_stylesheets.iter()),
+             &guards,
+             Some(ua_stylesheets),
+             data.stylesheets_changed,
+             /* author_styles_disabled = */ false,
+             &mut extra_data);
+         let needs_reflow = viewport_size_changed && !needs_dirtying;
++        //println!("Check if we are going to insert restyle_subtree.");
+         if needs_dirtying {
++            //println!("Check if we have data on the element.");
+             if let Some(mut d) = element.mutate_data() {
++                //println!("Check if we have styles.");
+                 if d.has_styles() {
++                    //println!("Restyling subtree!");
+                     d.restyle.hint.insert(RestyleHint::restyle_subtree());
+                 }
+             }
+         }
+         if needs_reflow {
+             if let Some(mut flow) = self.try_get_layout_root(element.as_node()) {
+                 LayoutThread::reflow_all_nodes(FlowRef::deref_mut(&mut flow));
+             }
+diff -r 5805d929bec9 components/script/dom/bindings/trace.rs
+--- a/components/script/dom/bindings/trace.rs	Thu Jul 27 11:07:29 2017 -0500
++++ b/components/script/dom/bindings/trace.rs	Thu Jul 27 13:21:13 2017 -0700
+@@ -91,16 +91,17 @@ use std::sync::{Arc, Mutex};
+ use std::sync::atomic::{AtomicBool, AtomicUsize};
+ use std::sync::mpsc::{Receiver, Sender};
+ use std::time::{SystemTime, Instant};
+ use style::attr::{AttrIdentifier, AttrValue, LengthOrPercentageOrAuto};
+ use style::context::QuirksMode;
+ use style::element_state::*;
+ use style::media_queries::MediaList;
+ use style::properties::PropertyDeclarationBlock;
++use style::properties_and_values;
+ use style::selector_parser::{PseudoElement, Snapshot};
+ use style::shared_lock::{SharedRwLock as StyleSharedRwLock, Locked as StyleLocked};
+ use style::stylesheets::{CssRules, FontFaceRule, KeyframesRule, MediaRule};
+ use style::stylesheets::{NamespaceRule, StyleRule, ImportRule, SupportsRule, ViewportRule};
+ use style::stylesheets::keyframes_rule::Keyframe;
+ use style::values::specified::Length;
+ use time::Duration;
+ use uuid::Uuid;
+@@ -393,16 +394,17 @@ unsafe_no_jsmanaged_fields!(WebGLBufferI
+ unsafe_no_jsmanaged_fields!(WebGLFramebufferId);
+ unsafe_no_jsmanaged_fields!(WebGLProgramId);
+ unsafe_no_jsmanaged_fields!(WebGLRenderbufferId);
+ unsafe_no_jsmanaged_fields!(WebGLShaderId);
+ unsafe_no_jsmanaged_fields!(WebGLTextureId);
+ unsafe_no_jsmanaged_fields!(WebGLVertexArrayId);
+ unsafe_no_jsmanaged_fields!(MediaList);
+ unsafe_no_jsmanaged_fields!(WebVRGamepadHand);
++unsafe_no_jsmanaged_fields!(RwLock<properties_and_values::RegisteredPropertySet>);
+ 
+ unsafe impl<'a> JSTraceable for &'a str {
+     #[inline]
+     unsafe fn trace(&self, _: *mut JSTracer) {
+         // Do nothing
+     }
+ }
+ 
+diff -r 5805d929bec9 components/script/dom/css.rs
+--- a/components/script/dom/css.rs	Thu Jul 27 11:07:29 2017 -0500
++++ b/components/script/dom/css.rs	Thu Jul 27 13:21:13 2017 -0700
+@@ -1,24 +1,34 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
++use app_units::Au;
+ use cssparser::{Parser, ParserInput, serialize_identifier};
++use dom::bindings::codegen::Bindings::DocumentBinding::DocumentBinding::DocumentMethods;
++use dom::bindings::codegen::Bindings::PropertyDescriptorDictBinding::PropertyDescriptorDict;
+ use dom::bindings::codegen::Bindings::WindowBinding::WindowBinding::WindowMethods;
+-use dom::bindings::error::Fallible;
++use dom::bindings::error::{Error, Fallible};
++use dom::bindings::inheritance::Castable;
+ use dom::bindings::reflector::Reflector;
+ use dom::bindings::str::DOMString;
++use dom::node::{Node, NodeDamage};
+ use dom::window::Window;
+ use dom_struct::dom_struct;
+-use style::context::QuirksMode;
++use style::Atom;
++use style::context::{SharedStyleContext, QuirksMode};
++use style::font_metrics::FontMetricsProvider;
+ use style::parser::ParserContext;
++use style::custom_properties;
++use style::invalidation::element::restyle_hints::RestyleHint;
++use style::properties_and_values::{Registration, Syntax};
+ use style::stylesheets::CssRuleType;
+ use style::stylesheets::supports_rule::{Declaration, parse_condition_or_declaration};
+-use style_traits::PARSING_MODE_DEFAULT;
++use style_traits::{PARSING_MODE_DEFAULT, ToCss};
+ 
+ #[dom_struct]
+ pub struct CSS {
+     reflector_: Reflector,
+ }
+ 
+ impl CSS {
+     /// http://dev.w3.org/csswg/cssom/#serialize-an-identifier
+@@ -52,9 +62,147 @@ impl CSS {
+             let context = ParserContext::new_for_cssom(&url, win.css_error_reporter(), Some(CssRuleType::Supports),
+                                                        PARSING_MODE_DEFAULT,
+                                                        QuirksMode::NoQuirks);
+             cond.eval(&context)
+         } else {
+             false
+         }
+     }
++
++    // https://drafts.css-houdini.org/css-properties-values-api/#dom-css-registerproperty
++    pub fn RegisterProperty(win: &Window, options: &PropertyDescriptorDict) -> Result<(), Error> {
++        use euclid::{ScaleFactor, TypedSize2D};
++        use style::values::computed;
++        use style::context::QuirksMode;
++        use style::media_queries::MediaType;
++        use style::properties::{ComputedValues, StyleBuilder};
++        use style::servo::media_queries::Device;
++        let phony_device = Device::new(
++            MediaType::Screen,
++            TypedSize2D::new(1024.0, 768.0),
++            ScaleFactor::new(1.0),
++        );
++        let phony_font_metrics_provider = PhonyFontMetricsProvider;
++        let phony_computed_context = computed::Context {
++            is_root_element: false,
++            builder: StyleBuilder::for_derived_style(
++                &phony_device,
++                ComputedValues::initial_values(),
++                None,
++                None,
++            ),
++            font_metrics_provider: &phony_font_metrics_provider,
++            cached_system_font: None,
++            in_media_query: false,
++            quirks_mode: win.Document().quirks_mode(),
++            for_smil_animation: false,
++        };
++
++        let name = match custom_properties::parse_name((*options.name).into()) {
++            Ok(name) => name,
++            Err(()) => return Err(Error::Syntax),
++        };
++
++        let syntax = match Syntax::from_string(&options.syntax) {
++            Ok(syntax) => syntax,
++            Err(()) => return Err(Error::Syntax),
++        };
++
++        let initial_value = match options.initialValue {
++            Some(ref specified) => {
++                let url = win.Document().url();
++                let context = ParserContext::new_for_cssom(
++                    &url,
++                    win.css_error_reporter(),
++                    /* rule_type */ None,
++                    PARSING_MODE_DEFAULT,
++                    win.Document().quirks_mode()
++                );
++                let mut input = ParserInput::new(specified);
++                let mut input = Parser::new(&mut input);
++                let parsed = match syntax.parse(&context, &mut input) {
++                    Ok(parsed) => {
++                        if parsed.is_computationally_independent() {
++                            Some(parsed)
++                        } else {
++                            return Err(Error::Syntax)
++                        }
++                    },
++                    _ => return Err(Error::Syntax)
++                };
++                // The initial value should be computationally independent, so
++                // we should be able to "compute" it with a phony context.
++                parsed.map(|parsed| {
++                    parsed.to_computed_value(&phony_computed_context)
++                          .expect("We should be always able to compute a parsed initial value.")
++                })
++            },
++            None => None,
++        };
++
++        let registered_property_set = win.Document().registered_property_set();
++        let mut registered_property_set = registered_property_set.write();
++        let result =
++            registered_property_set
++            .register_property(Registration {
++                name: name.into(),
++                syntax: syntax,
++                inherits: options.inherits,
++                initial_value: initial_value,
++            })
++            .or(Err(Error::InvalidModification));
++
++        if result.is_ok() {
++            //if let Some(ref element) = win.Document().GetDocumentElement() {
++            //    let mut entry = win.Document().ensure_pending_restyle(element);
++            //    entry.hint.insert(RestyleHint::restyle_subtree());
++            //}
++            // Should lead to the RestyleHint::restyle_subtree() being inserted
++            // eventually in handle_reflow due to checks in Stylist.
++            if let Some(element) = win.Document().GetDocumentElement() {
++                element.upcast::<Node>().dirty(NodeDamage::NodeStyleDamaged);
++            }
++        }
++
++        result
++    }
++
++    // https://drafts.css-houdini.org/css-properties-values-api/#dom-css-unregisterproperty
++    pub fn UnregisterProperty(win: &Window, name: DOMString) -> Result<(), Error> {
++        let name = match custom_properties::parse_name(&*name) {
++            Ok(name) => name,
++            Err(()) => return Err(Error::Syntax),
++        };
++        let registered_property_set = win.Document().registered_property_set();
++        let mut registered_property_set = registered_property_set.write();
++        let result =
++            registered_property_set
++            .unregister_property(&name.into())
++            .or(Err(Error::NotFound));
++
++        if result.is_ok() {
++            //win.Document().GetDocumentElement().
++            if let Some(element) = win.Document().GetDocumentElement() {
++                element.upcast::<Node>().dirty(NodeDamage::NodeStyleDamaged);
++            }
++            // how is reflow getting triggered?
++            //if let Some(ref element) = win.Document().GetDocumentElement() {
++            //    let mut entry = win.Document().ensure_pending_restyle(element);
++            //    entry.hint.insert(RestyleHint::restyle_subtree());
++            //}
++        }
++
++        result
++    }
+ }
++
++#[derive(Debug)]
++struct PhonyFontMetricsProvider;
++
++impl FontMetricsProvider for PhonyFontMetricsProvider {
++    fn get_size(&self, _font_name: &Atom, _font_family: u8) -> Au {
++        Au(0)
++    }
++    fn create_from(_context: &SharedStyleContext) -> Self where Self: Sized {
++        PhonyFontMetricsProvider
++    }
++}
+diff -r 5805d929bec9 components/script/dom/document.rs
+--- a/components/script/dom/document.rs	Thu Jul 27 11:07:29 2017 -0500
++++ b/components/script/dom/document.rs	Thu Jul 27 13:21:13 2017 -0700
+@@ -105,16 +105,17 @@ use msg::constellation_msg::{ALT, CONTRO
+ use msg::constellation_msg::{BrowsingContextId, Key, KeyModifiers, KeyState, TopLevelBrowsingContextId};
+ use net_traits::{FetchResponseMsg, IpcSend, ReferrerPolicy};
+ use net_traits::CookieSource::NonHTTP;
+ use net_traits::CoreResourceMsg::{GetCookiesForUrl, SetCookiesForUrl};
+ use net_traits::pub_domains::is_pub_domain;
+ use net_traits::request::RequestInit;
+ use net_traits::response::HttpsState;
+ use num_traits::ToPrimitive;
++use parking_lot::RwLock;
+ use script_layout_interface::message::{Msg, ReflowQueryType};
+ use script_runtime::{CommonScriptMsg, ScriptThreadEventCategory};
+ use script_thread::{MainThreadScriptMsg, Runnable, ScriptThread};
+ use script_traits::{AnimationState, CompositorEvent, DocumentActivity};
+ use script_traits::{MouseButton, MouseEventType, MozBrowserEvent};
+ use script_traits::{MsDuration, ScriptMsg as ConstellationMsg, TouchpadPressurePhase};
+ use script_traits::{TouchEventType, TouchId};
+ use script_traits::UntrustedNodeAddress;
+@@ -130,16 +131,17 @@ use std::collections::hash_map::Entry::{
+ use std::default::Default;
+ use std::iter::once;
+ use std::mem;
+ use std::rc::Rc;
+ use std::time::{Duration, Instant};
+ use style::attr::AttrValue;
+ use style::context::{QuirksMode, ReflowGoal};
+ use style::invalidation::element::restyle_hints::{RestyleHint, RESTYLE_SELF, RESTYLE_STYLE_ATTRIBUTE};
++use style::properties_and_values::RegisteredPropertySet;
+ use style::selector_parser::{RestyleDamage, Snapshot};
+ use style::shared_lock::SharedRwLock as StyleSharedRwLock;
+ use style::str::{HTML_SPACE_CHARACTERS, split_html_space_chars, str_join};
+ use style::stylesheets::Stylesheet;
+ use task_source::TaskSource;
+ use time;
+ use timers::OneshotTimerCallback;
+ use url::Host;
+@@ -324,16 +326,20 @@ pub struct Document {
+     /// Entry node for fullscreen.
+     fullscreen_element: MutNullableJS<Element>,
+     /// Map from ID to set of form control elements that have that ID as
+     /// their 'form' content attribute. Used to reset form controls
+     /// whenever any element with the same ID as the form attribute
+     /// is inserted or removed from the document.
+     /// See https://html.spec.whatwg.org/multipage/#form-owner
+     form_id_listener_map: DOMRefCell<HashMap<Atom, HashSet<JS<Element>>>>,
++
++    /// The set of registered custom properties.
++    #[ignore_heap_size_of = "Arc"]
++    registered_property_set: Arc<RwLock<RegisteredPropertySet>>,
+ }
+ 
+ #[derive(JSTraceable, HeapSizeOf)]
+ struct ImagesFilter;
+ impl CollectionFilter for ImagesFilter {
+     fn filter(&self, elem: &Element, _root: &Node) -> bool {
+         elem.is::<HTMLImageElement>()
+     }
+@@ -2029,16 +2035,17 @@ pub enum DocumentSource {
+ #[allow(unsafe_code)]
+ pub trait LayoutDocumentHelpers {
+     unsafe fn is_html_document_for_layout(&self) -> bool;
+     unsafe fn drain_pending_restyles(&self) -> Vec<(LayoutJS<Element>, PendingRestyle)>;
+     unsafe fn needs_paint_from_layout(&self);
+     unsafe fn will_paint(&self);
+     unsafe fn quirks_mode(&self) -> QuirksMode;
+     unsafe fn style_shared_lock(&self) -> &StyleSharedRwLock;
++    unsafe fn registered_property_set(&self) -> Arc<RwLock<RegisteredPropertySet>>;
+ }
+ 
+ #[allow(unsafe_code)]
+ impl LayoutDocumentHelpers for LayoutJS<Document> {
+     #[inline]
+     unsafe fn is_html_document_for_layout(&self) -> bool {
+         (*self.unsafe_get()).is_html_document
+     }
+@@ -2070,16 +2077,21 @@ impl LayoutDocumentHelpers for LayoutJS<
+     unsafe fn quirks_mode(&self) -> QuirksMode {
+         (*self.unsafe_get()).quirks_mode()
+     }
+ 
+     #[inline]
+     unsafe fn style_shared_lock(&self) -> &StyleSharedRwLock {
+         (*self.unsafe_get()).style_shared_lock()
+     }
++
++    #[inline]
++    unsafe fn registered_property_set(&self) -> Arc<RwLock<RegisteredPropertySet>> {
++        (*self.unsafe_get()).registered_property_set()
++    }
+ }
+ 
+ // https://html.spec.whatwg.org/multipage/#is-a-registrable-domain-suffix-of-or-is-equal-to
+ // The spec says to return a bool, we actually return an Option<Host> containing
+ // the parsed host in the successful case, to avoid having to re-parse the host.
+ fn get_registrable_domain_suffix_of_or_is_equal_to(host_suffix_string: &str, original_host: Host) -> Option<Host> {
+     // Step 1
+     if host_suffix_string.is_empty() {
+@@ -2250,16 +2262,17 @@ impl Document {
+             referrer_policy: Cell::new(referrer_policy),
+             target_element: MutNullableJS::new(None),
+             last_click_info: DOMRefCell::new(None),
+             ignore_destructive_writes_counter: Default::default(),
+             spurious_animation_frames: Cell::new(0),
+             dom_count: Cell::new(1),
+             fullscreen_element: MutNullableJS::new(None),
+             form_id_listener_map: Default::default(),
++            registered_property_set: Default::default(),
+         }
+     }
+ 
+     // https://dom.spec.whatwg.org/#dom-document-document
+     pub fn Constructor(window: &Window) -> Fallible<Root<Document>> {
+         let doc = window.Document();
+         let docloader = DocumentLoader::new(&*doc.loader());
+         Ok(Document::new(window,
+@@ -2593,16 +2606,20 @@ impl Document {
+         if let Some(listeners) = map.get(id) {
+             for listener in listeners {
+                 listener.r().as_maybe_form_control()
+                         .expect("Element must be a form control")
+                         .reset_form_owner();
+             }
+         }
+     }
++
++    pub fn registered_property_set(&self) -> Arc<RwLock<RegisteredPropertySet>> {
++        self.registered_property_set.clone()
++    }
+ }
+ 
+ 
+ impl Element {
+     fn click_event_filter_by_disabled_state(&self) -> bool {
+         let node = self.upcast::<Node>();
+         match node.type_id() {
+             NodeTypeId::Element(ElementTypeId::HTMLElement(HTMLElementTypeId::HTMLButtonElement)) |
+diff -r 5805d929bec9 components/script/dom/webidls/CSS.webidl
+--- a/components/script/dom/webidls/CSS.webidl	Thu Jul 27 11:07:29 2017 -0500
++++ b/components/script/dom/webidls/CSS.webidl	Thu Jul 27 13:21:13 2017 -0700
+@@ -12,8 +12,16 @@ interface CSS {
+   static DOMString escape(DOMString ident);
+ };
+ 
+ // https://drafts.csswg.org/css-conditional-3/#the-css-interface
+ partial interface CSS {
+   static boolean supports(DOMString property, DOMString value);
+   static boolean supports(DOMString conditionText);
+ };
++
++// https://drafts.css-houdini.org/css-properties-values-api/#registering-custom-properties
++partial interface CSS {
++  [Throws,Pref="layout.css.properties-and-values.enabled"]
++  static void registerProperty(PropertyDescriptorDict descriptor);
++  [Throws,Pref="layout.css.properties-and-values.enabled"]
++  static void unregisterProperty(DOMString name);
++};
+diff -r 5805d929bec9 components/script/dom/webidls/PropertyDescriptorDict.webidl
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/components/script/dom/webidls/PropertyDescriptorDict.webidl	Thu Jul 27 13:21:13 2017 -0700
+@@ -0,0 +1,17 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++/*
++ * The origin of this IDL file is
++ * https://drafts.css-houdini.org/css-properties-values-api/#registering-custom-properties
++ */
++
++// Renamed from PropertyDescriptor to avoid conflicting with a JS class of the
++// same name.
++dictionary PropertyDescriptorDict
++{
++  required DOMString name;
++           DOMString syntax       = "*";
++           boolean inherits       = false;
++           DOMString initialValue;
++};
+diff -r 5805d929bec9 components/style/animation.rs
+--- a/components/style/animation.rs	Thu Jul 27 11:07:29 2017 -0500
++++ b/components/style/animation.rs	Thu Jul 27 13:21:13 2017 -0700
+@@ -12,16 +12,17 @@ use dom::OpaqueNode;
+ use font_metrics::FontMetricsProvider;
+ use properties::{self, CascadeFlags, ComputedValues, Importance};
+ use properties::animated_properties::{AnimatableLonghand, AnimatedProperty, TransitionProperty};
+ use properties::longhands::animation_direction::computed_value::single_value::T as AnimationDirection;
+ use properties::longhands::animation_iteration_count::single_value::computed_value::T as AnimationIterationCount;
+ use properties::longhands::animation_play_state::computed_value::single_value::T as AnimationPlayState;
+ use rule_tree::CascadeLevel;
+ use servo_arc::Arc;
++use std::borrow::Borrow;
+ use std::sync::mpsc::Sender;
+ use stylesheets::keyframes_rule::{KeyframesStep, KeyframesStepValue};
+ use timer::Timer;
+ use values::computed::Time;
+ use values::computed::transform::TimingFunction;
+ use values::generics::transform::{StepPosition, TimingFunction as GenericTimingFunction};
+ 
+ /// This structure represents a keyframes animation current iteration state.
+@@ -499,17 +500,18 @@ fn compute_style_for_animation_step(cont
+                                                iter,
+                                                Some(previous_style),
+                                                Some(previous_style),
+                                                Some(previous_style),
+                                                /* cascade_info = */ None,
+                                                /* visited_style = */ None,
+                                                font_metrics_provider,
+                                                CascadeFlags::empty(),
+-                                               context.quirks_mode);
++                                               context.quirks_mode,
++                                               context.stylist.registered_property_set().borrow());
+             computed
+         }
+     }
+ }
+ 
+ /// Triggers animations for a given node looking at the animation property
+ /// values.
+ pub fn maybe_start_animations(context: &SharedStyleContext,
+diff -r 5805d929bec9 components/style/custom_properties.rs
+--- a/components/style/custom_properties.rs	Thu Jul 27 11:07:29 2017 -0500
++++ b/components/style/custom_properties.rs	Thu Jul 27 13:21:13 2017 -0700
+@@ -2,81 +2,105 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ //! Support for [custom properties for cascading variables][custom].
+ //!
+ //! [custom]: https://drafts.csswg.org/css-variables/
+ 
+ use Atom;
+-use cssparser::{Delimiter, Parser, ParserInput, SourcePosition, Token, TokenSerializationType};
++use cssparser::{self, Delimiter, Parser, ParserInput, SourcePosition, Token, TokenSerializationType};
+ use parser::ParserContext;
+ use properties::{CSSWideKeyword, DeclaredValue};
+ use selectors::parser::SelectorParseError;
+ use servo_arc::Arc;
+ use std::ascii::AsciiExt;
+ use std::borrow::Cow;
+ use std::collections::{HashMap, hash_map, HashSet};
+ use std::fmt;
++use stylesheets::UrlExtraData;
+ use style_traits::{HasViewportPercentage, ToCss, StyleParseError, ParseError};
+ 
+ /// A custom property name is just an `Atom`.
+ ///
+ /// Note that this does not include the `--` prefix
+ pub type Name = Atom;
+ 
+ /// Parse a custom property name.
+ ///
+ /// https://drafts.csswg.org/css-variables/#typedef-custom-property-name
+ pub fn parse_name(s: &str) -> Result<&str, ()> {
+-    if s.starts_with("--") {
+-        Ok(&s[2..])
+-    } else {
+-        Err(())
++    let mut input = ParserInput::new(s);
++    let mut input = Parser::new(&mut input);
++
++    match input.expect_ident() {
++        Ok(_) if s.starts_with("--") => {
++            match input.expect_exhausted() {
++                Ok(()) => Ok(&s[2..]),
++                Err(_) => Err(()),
++            }
++        },
++        _ => Err(())
+     }
+ }
+ 
+ /// A specified value for a custom property is just a set of tokens.
+ ///
+ /// We preserve the original CSS for serialization, and also the variable
+ /// references to other custom property names.
+ #[derive(Clone, PartialEq, Debug)]
+ #[cfg_attr(feature = "servo", derive(HeapSizeOf))]
+ pub struct SpecifiedValue {
+-    css: String,
++    /// The specified text.
++    pub css: String,
+ 
+     first_token_type: TokenSerializationType,
+     last_token_type: TokenSerializationType,
+ 
+     /// Custom property names in var() functions.
+     references: HashSet<Name>,
++
++    /// The data necessary to resolve a URL.
++    pub url_data: UrlExtraData,
+ }
+ 
+ impl HasViewportPercentage for SpecifiedValue {
+     fn has_viewport_percentage(&self) -> bool {
+         panic!("has_viewport_percentage called before resolving!");
+     }
+ }
+ 
+ /// This struct is a cheap borrowed version of a `SpecifiedValue`.
++#[derive(Debug)]
+ pub struct BorrowedSpecifiedValue<'a> {
+     css: &'a str,
+     first_token_type: TokenSerializationType,
+     last_token_type: TokenSerializationType,
+     references: Option<&'a HashSet<Name>>,
++    /// The data necessary to resolve a URL.
++    pub url_data: Option<&'a UrlExtraData>,
+ }
+ 
+ /// A computed value is just a set of tokens as well, until we resolve variables
+ /// properly.
+ #[derive(Clone, Debug, Eq, PartialEq)]
+ #[cfg_attr(feature = "servo", derive(HeapSizeOf))]
+ pub struct ComputedValue {
+-    css: String,
+-    first_token_type: TokenSerializationType,
+-    last_token_type: TokenSerializationType,
++    /// The computed serialized value.
++    pub css: String,
++    /// The first token in the serialization.
++    /// Used when resolving variable references, because we would like to
++    /// substitute token streams rather than variables; in particular, if
++    /// `--foo: 5` and we write `width: var(--foo) em`, width should not be
++    /// `5em`, a dimension token with value `5` and unit `em`, but rather the
++    /// integer token `5` followed by the identifier `em`, which is invalid.
++    /// We implement this by adding /**/ in between (see ComputedValue::push).
++    pub first_token_type: TokenSerializationType,
++    /// The last token in the serialization.
++    pub last_token_type: TokenSerializationType,
+ }
+ 
+ impl ToCss for SpecifiedValue {
+     fn to_css<W>(&self, dest: &mut W) -> fmt::Result
+         where W: fmt::Write,
+     {
+         dest.write_str(&self.css)
+     }
+@@ -178,27 +202,34 @@ impl ComputedValue {
+ 
+     fn push_variable(&mut self, variable: &ComputedValue) {
+         self.push(&variable.css, variable.first_token_type, variable.last_token_type)
+     }
+ }
+ 
+ impl SpecifiedValue {
+     /// Parse a custom property SpecifiedValue.
+-    pub fn parse<'i, 't>(_context: &ParserContext, input: &mut Parser<'i, 't>)
++    pub fn parse<'i, 't>(context: &ParserContext, input: &mut Parser<'i, 't>)
+                          -> Result<Box<Self>, ParseError<'i>> {
+         let mut references = Some(HashSet::new());
+         let (first, css, last) = parse_self_contained_declaration_value(input, &mut references)?;
+         Ok(Box::new(SpecifiedValue {
+             css: css.into_owned(),
+             first_token_type: first,
+             last_token_type: last,
+             references: references.unwrap(),
++            url_data: context.url_data.clone(),
+         }))
+     }
++
++    /// Returns whether or not this specified value contains any variable
++    /// references.
++    pub fn has_references(&self) -> bool {
++        !self.references.is_empty()
++    }
+ }
+ 
+ /// Parse the value of a non-custom property that contains `var()` references.
+ pub fn parse_non_custom_with_var<'i, 't>
+                                 (input: &mut Parser<'i, 't>)
+                                 -> Result<(TokenSerializationType, Cow<'i, str>), ParseError<'i>> {
+     let (first_token_type, css, _) = parse_self_contained_declaration_value(input, &mut None)?;
+     Ok((first_token_type, css))
+@@ -239,17 +270,17 @@ fn parse_declaration_value<'i, 't>
+         input.reset(start_position);
+ 
+         parse_declaration_value_block(input, references, missing_closing_characters)
+     })
+ }
+ 
+ /// Like parse_declaration_value, but accept `!` and `;` since they are only
+ /// invalid at the top level
+-fn parse_declaration_value_block<'i, 't>
++pub fn parse_declaration_value_block<'i, 't>
+                                 (input: &mut Parser<'i, 't>,
+                                  references: &mut Option<HashSet<Name>>,
+                                  missing_closing_characters: &mut String)
+                                  -> Result<(TokenSerializationType, TokenSerializationType),
+                                            ParseError<'i>> {
+     let mut token_start = input.position();
+     let mut token = match input.next_including_whitespace_and_comments() {
+         // FIXME: remove clone() when borrows are non-lexical
+@@ -380,208 +411,466 @@ fn parse_var_function<'i, 't>(input: &mu
+         })?;
+     }
+     if let Some(ref mut refs) = *references {
+         refs.insert(Atom::from(name));
+     }
+     Ok(())
+ }
+ 
++/// XXX document
++pub enum KeywordAction {
++    /// XXX document
++    Remove,
++    /// XXX document
++    UseInitial,
++    /// XXX document
++    Inherit,
++}
++
+ /// Add one custom property declaration to a map, unless another with the same
+ /// name was already there.
+-pub fn cascade<'a>(custom_properties: &mut Option<HashMap<&'a Name, BorrowedSpecifiedValue<'a>>>,
+-                   inherited: &'a Option<Arc<CustomPropertiesMap>>,
+-                   seen: &mut HashSet<&'a Name>,
+-                   name: &'a Name,
+-                   specified_value: DeclaredValue<'a, Box<SpecifiedValue>>) {
++pub fn cascade<'a, F>(
++    custom_properties: &mut Option<HashMap<&'a Name, BorrowedSpecifiedValue<'a>>>,
++    inherited: &'a Option<Arc<CustomPropertiesMap>>,
++    handle_keyword: F,
++    seen: &mut HashSet<&'a Name>,
++    name: &'a Name,
++    specified_value: DeclaredValue<'a, Box<SpecifiedValue>>
++)
++where F: Fn(&'a Name, CSSWideKeyword) -> KeywordAction
++{
+     let was_already_present = !seen.insert(name);
+     if was_already_present {
+         return;
+     }
+ 
++    #[inline]
++    fn borrow_computed_value<'a>(computed: &'a ComputedValue) -> BorrowedSpecifiedValue<'a> {
++        BorrowedSpecifiedValue {
++            css: &computed.css,
++            first_token_type: computed.first_token_type,
++            last_token_type: computed.last_token_type,
++            references: None,
++            url_data: None,
++        }
++    }
++
+     let map = match *custom_properties {
+         Some(ref mut map) => map,
+         None => {
+             *custom_properties = Some(match *inherited {
+-                Some(ref inherited) => inherited.iter().map(|(key, inherited_value)| {
+-                    (key, BorrowedSpecifiedValue {
+-                        css: &inherited_value.css,
+-                        first_token_type: inherited_value.first_token_type,
+-                        last_token_type: inherited_value.last_token_type,
+-                        references: None
+-                    })
++                Some(ref inherited) => inherited.iter().filter_map(|(key, inherited_value)| {
++                    let value = match handle_keyword(name, CSSWideKeyword::Unset) {
++                        KeywordAction::Inherit => Some(borrow_computed_value(inherited_value)),
++                        // Let this be overwritten by a specified value if
++                        // necessary; otherwise we'll fill it in later.
++                        KeywordAction::UseInitial => None,
++                        KeywordAction::Remove => None,
++                    };
++                    value.map(|x| (key, x))
+                 }).collect(),
+                 None => HashMap::new(),
+             });
+             custom_properties.as_mut().unwrap()
+         }
+     };
+     match specified_value {
+         DeclaredValue::Value(ref specified_value) => {
+             map.insert(name, BorrowedSpecifiedValue {
+                 css: &specified_value.css,
+                 first_token_type: specified_value.first_token_type,
+                 last_token_type: specified_value.last_token_type,
+                 references: Some(&specified_value.references),
++                url_data: Some(&specified_value.url_data),
+             });
+         },
+         DeclaredValue::WithVariables(_) => unreachable!(),
+-        DeclaredValue::CSSWideKeyword(keyword) => match keyword {
+-            CSSWideKeyword::Initial => {
+-                map.remove(&name);
++        DeclaredValue::CSSWideKeyword(keyword) => {
++            match handle_keyword(name, keyword) {
++                KeywordAction::Remove => { map.remove(&name); },
++                // We fill this in later.
++                KeywordAction::UseInitial => (),
++                // The inherited value is what we already have, if we are an
++                // inherited custom property (whence we initialize
++                // *custom_properties above). But we might not be!
++                KeywordAction::Inherit => {
++                    if !map.contains_key(&name) {
++                        let inherited_value =
++                            inherited
++                            .as_ref()
++                            .and_then(|inherited| inherited.get_computed_value(name));
++                        if let Some(inherited_value) = inherited_value {
++                            map.insert(&name, borrow_computed_value(inherited_value));
++                        }
++                    }
++                },
+             }
+-            CSSWideKeyword::Unset | // Custom properties are inherited by default.
+-            CSSWideKeyword::Inherit => {} // The inherited value is what we already have.
+         }
+     }
+ }
+ 
+-/// Returns the final map of applicable custom properties.
+-///
+-/// If there was any specified property, we've created a new map and now we need
+-/// to remove any potential cycles, and wrap it in an arc.
+-///
+-/// Otherwise, just use the inherited custom properties map.
+-pub fn finish_cascade(specified_values_map: Option<HashMap<&Name, BorrowedSpecifiedValue>>,
+-                      inherited: &Option<Arc<CustomPropertiesMap>>)
+-                      -> Option<Arc<CustomPropertiesMap>> {
+-    if let Some(mut map) = specified_values_map {
+-        remove_cycles(&mut map);
+-        Some(Arc::new(substitute_all(map, inherited)))
+-    } else {
+-        inherited.clone()
+-    }
+-}
++///// Returns the final map of applicable custom properties.
++/////
++///// If there was any specified property, we've created a new map and now we need
++///// to remove any potential cycles, and wrap it in an arc.
++/////
++///// Otherwise, just use the inherited custom properties map.
++//pub fn finish_cascade(specified_values_map: Option<HashMap<&Name, BorrowedSpecifiedValue>>,
++//                      inherited: &Option<Arc<CustomPropertiesMap>>)
++//                      -> Option<Arc<CustomPropertiesMap>> {
++//    if let Some(mut map) = specified_values_map {
++//        remove_cycles(&mut map);
++//        Some(Arc::new(substitute_all(map, &None, inherited, &|_, x| x)))
++//    } else {
++//        inherited.clone()
++//    }
++//}
+ 
+-/// https://drafts.csswg.org/css-variables/#cycles
++/// Identify and remove cyclical variable declarations, identify if font-size is
++/// involved in a cycle, and identify those variables that must be computed
++/// before font-size.
++///
++/// specified[p] is removed if p is involved in a cycle.
++///
++/// Finally, we return whether font-size is involved in a cycle as well as the
++/// set of those variables (possibly transitively) referenced by the declaration
++/// of font-size. We count references in fallbacks (as does cycle detection).
+ ///
+-/// The initial value of a custom property is represented by this property not
+-/// being in the map.
+-fn remove_cycles(map: &mut HashMap<&Name, BorrowedSpecifiedValue>) {
+-    let mut to_remove = HashSet::new();
+-    {
+-        let mut visited = HashSet::new();
+-        let mut stack = Vec::new();
+-        for name in map.keys() {
+-            walk(map, name, &mut stack, &mut visited, &mut to_remove);
++/// For the purposes of cycle detection, we imagine font-size as another
++/// variable, and create an edge in the dependency graph from a variable to
++/// font-size if the variable is in possibly_font_size_dependent and if we parse
++/// a dimension token inside. The caller should put those variables in
++/// possibly_font_size_dependent that have as a possible syntax at least one of
++/// <length>, <length-percentage>, or <transform-function> (syntaxes whose
++/// computation might involve computing absolute lengths from relative lengths).
++pub fn analyze_dependencies(
++    specified: &mut HashMap<&Name, BorrowedSpecifiedValue>,
++    //font_size: Option<&'b str>,
++    referenced_by_font_size: &HashSet<Name>,
++    referenced_by_others: &HashSet<Name>,
++    possibly_font_size_dependent: &HashSet<Name>,
++) -> (bool, HashSet<Name>, HashSet<Name>)
++{
++    /*
++    // Identify the variables referenced by the font-size declaration, if
++    // provided.
++    let mut referenced_by_font_size = Vec::new();
++    if let Some(specified) = font_size {
++        fn detect_vars<'i, 'tt>(
++            references: &mut Vec<Name>,
++            input: &mut Parser<'i, 'tt>
++        ) -> Result<(), cssparser::ParseError<'i, ()>> {
++            while !input.is_exhausted() {
++                let token = match input.next() {
++                    Ok(token) => token,
++                    Err(_) => return Err(cssparser::ParseError::Custom(())),
++                };
++                // We have to descend into functions.
++                match token {
++                    Token::Function(ref name) if name.eq_ignore_ascii_case("var") => {
++                        input.parse_nested_block(|input| {
++                            let name = input.expect_ident().unwrap();
++                            let name = Atom::from(parse_name(&name).unwrap());
++                            references.push(name);
+ 
+-            fn walk<'a>(map: &HashMap<&'a Name, BorrowedSpecifiedValue<'a>>,
+-                        name: &'a Name,
+-                        stack: &mut Vec<&'a Name>,
+-                        visited: &mut HashSet<&'a Name>,
+-                        to_remove: &mut HashSet<Name>) {
+-                let already_visited_before = !visited.insert(name);
+-                if already_visited_before {
++                            // Check the fallback if necessary.
++                            match input.expect_comma() {
++                                Ok(_) => detect_vars(references, input),
++                                Err(_) => Ok(())
++                            }
++                        }).unwrap()
++                    },
++                    Token::Function(_) |
++                    Token::ParenthesisBlock |
++                    Token::CurlyBracketBlock |
++                    Token::SquareBracketBlock => {
++                        input.parse_nested_block(|input| {
++                            detect_vars(references, input)
++                        }).unwrap()
++                    }
++                    _ => ()
++                }
++            }
++            Ok(())
++        }
++
++        let mut input = ParserInput::new(specified);
++        let mut input = Parser::new(&mut input);
++        detect_vars(&mut referenced_by_font_size, &mut input).unwrap()
++    }
++    */
++
++    fn walk<'a>(
++        specified: &HashMap<&'a Name, BorrowedSpecifiedValue<'a>>,
++        // None if we aren't descending down font-size.
++        // Some((set, might_require_computation)) if we are descending down
++        // font-size; might_require_computation is set to true if we are looking
++        // at a dependency of a custom property that might require computation.
++        // Determine to be cyclical if the set contains us and we have an em in
++        // our declaration, or if one of our descendants in the tree (for which
++        // might_require_computation is set to true) contains an em.
++        font_size_data: Option<(&HashSet<Name>, bool)>,
++        name: &'a Name,
++        stack: &mut Vec<&'a Name>,
++        visited: &mut HashSet<&'a Name>,
++        cyclical: &mut HashSet<Name>,
++        font_size_cyclical: &mut bool,
++    ) {
++        let already_visited_before = !visited.insert(name);
++        if already_visited_before {
++            return
++        }
++
++        let (declaration, references) = {
++            if let Some(declaration) = specified.get(name) {
++                if let Some(references) = declaration.references {
++                    (declaration, references)
++                } else {
++                    // No variables referenced.
+                     return
+                 }
+-                if let Some(value) = map.get(name) {
+-                    if let Some(references) = value.references {
+-                        stack.push(name);
+-                        for next in references {
+-                            if let Some(position) = stack.iter().position(|&x| x == next) {
+-                                // Found a cycle
+-                                for &in_cycle in &stack[position..] {
+-                                    to_remove.insert(in_cycle.clone());
+-                                }
+-                            } else {
+-                                walk(map, next, stack, visited, to_remove);
++            } else {
++                // Invalid variable reference--will handle later.
++                return
++            }
++        };
++
++        stack.push(name);
++
++        // Recurse into variable references.
++        for next in references {
++            if let Some(position) = stack.iter().position(|&x| x == next) {
++                // Found a cycle!
++                for in_cycle in &stack[position..] {
++                    cyclical.insert((*in_cycle).clone());
++                }
++            } else {
++                let font_size_data = match font_size_data {
++                    Some((possibly_font_size_dependent, false))
++                    if possibly_font_size_dependent.contains(name) => {
++                        Some((possibly_font_size_dependent, true))
++                    },
++                    _ => font_size_data,
++                };
++                walk(specified, font_size_data, next, stack, visited, cyclical,
++                     font_size_cyclical);
++            }
++        }
++
++        // If this is a registered custom property whose computation
++        // calculation requires font-size, recurse into the
++        // references for font-size.
++        let might_cause_font_size_cycle = {
++            if let Some((possibly_font_size_dependent, might_require_computation)) = font_size_data {
++                might_require_computation || possibly_font_size_dependent.contains(name)
++            } else {
++                false
++            }
++        };
++        if might_cause_font_size_cycle {
++            fn detect_ems<'i, 'tt>(input: &mut Parser<'i, 'tt>)
++                                   -> Result<bool, cssparser::ParseError<'i, ()>> {
++                while !input.is_exhausted() {
++                    let token = input.next()?.clone();
++                    // We have to descend into functions.
++                    match token {
++                        Token::Function(_) => {
++                            if input.parse_nested_block(detect_ems).unwrap() {
++                                return Ok(true)
++                            }
++                        },
++                        Token::Dimension { ref unit, .. } => {
++                            if unit.eq_ignore_ascii_case("em") ||
++                               unit.eq_ignore_ascii_case("rem") {
++                                return Ok(true)
+                             }
+                         }
+-                        stack.pop();
++                        _ => ()
+                     }
+                 }
++                Ok(false)
++            }
++
++            let mut input = ParserInput::new(declaration.css);
++            let mut input = Parser::new(&mut input);
++
++            if detect_ems(&mut input).unwrap() {
++                // Found a cycle involving font-size!
++                *font_size_cyclical = true;
++                for in_cycle in stack.iter() {
++                    cyclical.insert((*in_cycle).clone());
++                }
+             }
+         }
++
++        stack.pop();
+     }
+-    for name in &to_remove {
+-        map.remove(name);
++
++    // Identify cycles.
++
++    let mut cyclical = HashSet::new();
++    let mut font_size_cyclical = false;
++    let mut visited = HashSet::new();
++    // We recursively follow variable references in declarations, and push
++    // the current variable to the stack, so that the declaration for
++    // stack[i] has a variable reference to stack[i+1]. So if we see a
++    // reference to a variable which already appears on the stack, we know
++    // that we have a cycle.
++    let mut stack = Vec::new();
++
++    // Check variables referenced by font-size first, to identify if there is a
++    // cycle involving font-size.
++    // Then, check variables referenced by other properties which we need to
++    // check (i.e. "early" properties).
++    // Then we can just take visited to get those variables which are
++    // transitively referenced by it.
++    for name in referenced_by_font_size {
++        walk(specified, Some((possibly_font_size_dependent, false)), &name,
++             &mut stack, &mut visited, &mut cyclical, &mut font_size_cyclical);
+     }
++    for name in referenced_by_others {
++        walk(specified, None, &name, &mut stack, &mut visited, &mut cyclical,
++             &mut font_size_cyclical);
++    }
++    let mut dependencies = visited.clone();
++    let dependencies: HashSet<Name> = dependencies.drain().map(|x| x.clone()).collect();
++
++    for name in specified.keys() {
++        walk(specified, None, name, &mut stack, &mut visited, &mut cyclical,
++             &mut font_size_cyclical);
++    }
++
++    //for name in cyclical {
++    //    specified.remove(name);
++    //    // XXX If we wanted dependencies to be completely accurate, we would
++    //    // remove z if x depends on y depends on z yet y is involved in a cycle.
++    //    // But we don't really need that; we just want to include all those
++    //    // properties that are depended on by early properties. Properties that
++    //    // are in dependencies can't depend on those early properties (the only
++    //    // such dependency we can have here is one on font-size) because in that
++    //    // case we would have detected the cycle; by resetting to the initial
++    //    // value (which is computationally independent) we no longer have the
++    //    // cycle.
++    //    //dependencies.remove(name);
++    //}
++
++    (font_size_cyclical, dependencies, cyclical)
+ }
+ 
+ /// Replace `var()` functions for all custom properties.
+-fn substitute_all(specified_values_map: HashMap<&Name, BorrowedSpecifiedValue>,
+-                  inherited: &Option<Arc<CustomPropertiesMap>>)
+-                  -> CustomPropertiesMap {
+-    let mut custom_properties_map = CustomPropertiesMap::new();
++pub fn substitute_all<C, H>(
++    specified_values_map: &HashMap<&Name, BorrowedSpecifiedValue>,
++    to_substitute: &Option<HashSet<Name>>,
++    /*inherited: &Option<Arc<CustomPropertiesMap>>,*/
++    custom_properties_map: &mut CustomPropertiesMap,
++    compute: &C,
++    handle_invalid: &H,
++) 
++where C: Fn(&Name, ComputedValue) -> Result<ComputedValue, ()>,
++      H: Fn(&Name) -> Result<ComputedValue, ()>,
++{
+     let mut invalid = HashSet::new();
+-    for (&name, value) in &specified_values_map {
++    for (&name, value) in specified_values_map {
++        if !to_substitute.as_ref().map(|x| x.contains(name)).unwrap_or(true) {
++            continue
++        }
+         // If this value is invalid at computed-time it won’t be inserted in computed_values_map.
+         // Nothing else to do.
+         let _ = substitute_one(
+-            name, value, &specified_values_map, inherited, None,
+-            &mut custom_properties_map, &mut invalid);
++            name, value, specified_values_map, /*inherited, */None,
++            custom_properties_map, &mut invalid, compute, handle_invalid);
+     }
+-
+-    custom_properties_map
+ }
+ 
+ /// Replace `var()` functions for one custom property.
+ /// Also recursively record results for other custom properties referenced by `var()` functions.
+ /// Return `Err(())` for invalid at computed time.
+ /// or `Ok(last_token_type that was pushed to partial_computed_value)` otherwise.
+-fn substitute_one(name: &Name,
+-                  specified_value: &BorrowedSpecifiedValue,
+-                  specified_values_map: &HashMap<&Name, BorrowedSpecifiedValue>,
+-                  inherited: &Option<Arc<CustomPropertiesMap>>,
+-                  partial_computed_value: Option<&mut ComputedValue>,
+-                  custom_properties_map: &mut CustomPropertiesMap,
+-                  invalid: &mut HashSet<Name>)
+-                  -> Result<TokenSerializationType, ()> {
++fn substitute_one<C, H>(
++    name: &Name,
++    specified_value: &BorrowedSpecifiedValue,
++    specified_values_map: &HashMap<&Name, BorrowedSpecifiedValue>,
++    /*inherited: &Option<Arc<CustomPropertiesMap>>,*/
++    mut partial_computed_value: Option<&mut ComputedValue>,
++    custom_properties_map: &mut CustomPropertiesMap,
++    invalid: &mut HashSet<Name>,
++    compute: &C,
++    handle_invalid: &H,
++) -> Result<TokenSerializationType, ()>
++where C: Fn(&Name, ComputedValue) -> Result<ComputedValue, ()>,
++      H: Fn(&Name) -> Result<ComputedValue, ()>,
++{
+     if let Some(computed_value) = custom_properties_map.get_computed_value(&name) {
+         if let Some(partial_computed_value) = partial_computed_value {
+             partial_computed_value.push_variable(computed_value)
+         }
+         return Ok(computed_value.last_token_type)
+     }
+-
+     if invalid.contains(name) {
+         return Err(());
+     }
+     let computed_value = if specified_value.references.map(|set| set.is_empty()) == Some(false) {
+         let mut partial_computed_value = ComputedValue::empty();
+         let mut input = ParserInput::new(&specified_value.css);
+         let mut input = Parser::new(&mut input);
+         let mut position = (input.position(), specified_value.first_token_type);
+         let result = substitute_block(
+             &mut input, &mut position, &mut partial_computed_value,
+             &mut |name, partial_computed_value| {
+                 if let Some(other_specified_value) = specified_values_map.get(name) {
+-                    substitute_one(name, other_specified_value, specified_values_map, inherited,
+-                                   Some(partial_computed_value), custom_properties_map, invalid)
++                    substitute_one(name, other_specified_value,
++                                   specified_values_map, /*inherited,*/
++                                   Some(partial_computed_value),
++                                   custom_properties_map, invalid, compute,
++                                   handle_invalid)
+                 } else {
+                     Err(())
+                 }
+             }
+         );
+         if let Ok(last_token_type) = result {
+             partial_computed_value.push_from(position, &input, last_token_type);
+-            partial_computed_value
++            Ok(partial_computed_value)
+         } else {
+-            // Invalid at computed-value time. Use the inherited value.
+-            if let Some(inherited_value) = inherited.as_ref().and_then(|i| i.values.get(name)) {
+-                inherited_value.clone()
+-            } else {
+-                invalid.insert(name.clone());
+-                return Err(())
+-            }
++            Err(())
+         }
+     } else {
+         // The specified value contains no var() reference
+-        ComputedValue {
++        Ok(ComputedValue {
+             css: specified_value.css.to_owned(),
+             first_token_type: specified_value.first_token_type,
+             last_token_type: specified_value.last_token_type,
+-        }
++        })
+     };
+-    if let Some(partial_computed_value) = partial_computed_value {
+-        partial_computed_value.push_variable(&computed_value)
+-    }
+-    let last_token_type = computed_value.last_token_type;
+-    custom_properties_map.insert(name, computed_value);
+-    Ok(last_token_type)
++
++    computed_value
++    .and_then(|x| compute(name, x))
++    .or_else(|()| {
++        let result = handle_invalid(name);
++        if let Err(()) = result {
++            invalid.insert(name.clone());
++        }
++        result
++        //// Invalid at computed-value time. Use the inherited value.
++        //if let Some(inherited_value) = inherited.as_ref().and_then(|i| i.values.get(name)) {
++        //    Ok(inherited_value.clone())
++        //} else {
++        //    invalid.insert(name.clone());
++        //    Err(())
++        //}
++    })
++    .and_then(|x| {
++        if let Some(ref mut partial_computed_value) = partial_computed_value {
++            partial_computed_value.push_variable(&x)
++        }
++        let last_token_type = x.last_token_type;
++        custom_properties_map.insert(name, x);
++        Ok(last_token_type)
++    })
+ }
+ 
+ /// Replace `var()` functions in an arbitrary bit of input.
+ ///
+ /// The `substitute_one` callback is called for each `var()` function in `input`.
+ /// If the variable has its initial value,
+ /// the callback should return `Err(())` and leave `partial_computed_value` unchanged.
+ /// Otherwise, it should push the value of the variable (with its own `var()` functions replaced)
+@@ -623,16 +912,18 @@ fn substitute_block<'i, 't, F>(input: &m
+ 
+                     if let Ok(last) = substitute_one(&name, partial_computed_value) {
+                         last_token_type = last;
+                         // Skip over the fallback, as `parse_nested_block` would return `Err`
+                         // if we don’t consume all of `input`.
+                         // FIXME: Add a specialized method to cssparser to do this with less work.
+                         while let Ok(_) = input.next() {}
+                     } else {
++                        // Try to substitute any variable references in the
++                        // fallback.
+                         input.expect_comma()?;
+                         let position = input.position();
+                         let first_token_type = input.next_including_whitespace_and_comments()
+                             // parse_var_function() ensures that .unwrap() will not fail.
+                             .unwrap()
+                             .serialization_type();
+                         input.reset(position);
+                         let mut position = (position, first_token_type);
+diff -r 5805d929bec9 components/style/gecko/data.rs
+--- a/components/style/gecko/data.rs	Thu Jul 27 11:07:29 2017 -0500
++++ b/components/style/gecko/data.rs	Thu Jul 27 13:21:13 2017 -0700
+@@ -11,16 +11,17 @@ use fnv::FnvHashMap;
+ use gecko::rules::{CounterStyleRule, FontFaceRule};
+ use gecko_bindings::bindings::{self, RawServoStyleSet};
+ use gecko_bindings::structs::{ServoStyleSheet, StyleSheetInfo, ServoStyleSheetInner};
+ use gecko_bindings::structs::RawGeckoPresContextOwned;
+ use gecko_bindings::structs::nsIDocument;
+ use gecko_bindings::sugar::ownership::{HasArcFFI, HasBoxFFI, HasFFI, HasSimpleFFI};
+ use invalidation::media_queries::{MediaListKey, ToMediaListKey};
+ use media_queries::{Device, MediaList};
++use parking_lot::RwLock;
+ use properties::ComputedValues;
+ use servo_arc::Arc;
+ use shared_lock::{Locked, StylesheetGuards, SharedRwLockReadGuard};
+ use stylesheet_set::StylesheetSet;
+ use stylesheets::{Origin, StylesheetContents, StylesheetInDocument};
+ use stylist::{ExtraStyleData, Stylist};
+ 
+ /// Little wrapper to a Gecko style sheet.
+@@ -120,35 +121,42 @@ pub struct PerDocumentStyleDataImpl {
+     /// List of stylesheets, mirrored from Gecko.
+     pub stylesheets: StylesheetSet<GeckoStyleSheet>,
+ 
+     /// List of effective font face rules.
+     pub font_faces: Vec<(Arc<Locked<FontFaceRule>>, Origin)>,
+ 
+     /// Map for effective counter style rules.
+     pub counter_styles: FnvHashMap<Atom, Arc<Locked<CounterStyleRule>>>,
++
++    /// The set of registered custom properties.
++    pub registered_property_set: Arc<RwLock<RegisteredPropertySet>>,
+ }
+ 
+ /// The data itself is an `AtomicRefCell`, which guarantees the proper semantics
+ /// and unexpected races while trying to mutate it.
+ pub struct PerDocumentStyleData(AtomicRefCell<PerDocumentStyleDataImpl>);
+ 
+ impl PerDocumentStyleData {
+     /// Create a dummy `PerDocumentStyleData`.
+     pub fn new(pres_context: RawGeckoPresContextOwned) -> Self {
+         let device = Device::new(pres_context);
+         let quirks_mode = unsafe {
+             (*device.pres_context().mDocument.raw::<nsIDocument>()).mCompatMode
+         };
++        let stylist = Stylist::new(device, quirks_mode.into());
++        let registered_property_set: Arc<RwLock<RegisteredPropertySet>> = Default::default();
++        stylist.set_registered_proeprty_set(registered_property_set);
+ 
+         PerDocumentStyleData(AtomicRefCell::new(PerDocumentStyleDataImpl {
+-            stylist: Stylist::new(device, quirks_mode.into()),
++            stylist: ,
+             stylesheets: StylesheetSet::new(),
+             font_faces: vec![],
+             counter_styles: FnvHashMap::default(),
++            registered_property_set: registered_property_set,
+         }))
+     }
+ 
+     /// Get an immutable reference to this style data.
+     pub fn borrow(&self) -> AtomicRef<PerDocumentStyleDataImpl> {
+         self.0.borrow()
+     }
+ 
+diff -r 5805d929bec9 components/style/lib.rs
+--- a/components/style/lib.rs	Thu Jul 27 11:07:29 2017 -0500
++++ b/components/style/lib.rs	Thu Jul 27 13:21:13 2017 -0700
+@@ -72,17 +72,17 @@ extern crate parking_lot;
+ extern crate pdqsort;
+ #[cfg(feature = "gecko")] extern crate precomputed_hash;
+ extern crate rayon;
+ extern crate selectors;
+ #[cfg(feature = "servo")] #[macro_use] extern crate serde;
+ pub extern crate servo_arc;
+ #[cfg(feature = "servo")] #[macro_use] extern crate servo_atoms;
+ #[cfg(feature = "servo")] extern crate servo_config;
+-#[cfg(feature = "servo")] extern crate servo_url;
++extern crate servo_url;
+ extern crate smallvec;
+ #[macro_use]
+ extern crate style_derive;
+ #[macro_use]
+ extern crate style_traits;
+ extern crate time;
+ extern crate unicode_bidi;
+ #[allow(unused_extern_crates)]
+@@ -113,16 +113,17 @@ pub mod font_metrics;
+ #[cfg(feature = "gecko")] #[allow(unsafe_code)] pub mod gecko_bindings;
+ pub mod invalidation;
+ #[allow(missing_docs)] // TODO.
+ pub mod logical_geometry;
+ pub mod matching;
+ pub mod media_queries;
+ pub mod parallel;
+ pub mod parser;
++pub mod properties_and_values;
+ pub mod rule_tree;
+ pub mod scoped_tls;
+ pub mod selector_map;
+ pub mod selector_parser;
+ pub mod shared_lock;
+ pub mod sharing;
+ pub mod style_resolver;
+ pub mod stylist;
+diff -r 5805d929bec9 components/style/properties/longhand/box.mako.rs
+--- a/components/style/properties/longhand/box.mako.rs	Thu Jul 27 11:07:29 2017 -0500
++++ b/components/style/properties/longhand/box.mako.rs	Thu Jul 27 13:21:13 2017 -0700
+@@ -981,17 +981,17 @@
+                 SpecifiedOperation::Perspective(ref length) => write!(dest, "perspective({})", Css(length)),
+                 _ => unreachable!(),
+             }
+         }
+     }
+ 
+     #[derive(Clone, Debug, HasViewportPercentage, PartialEq)]
+     #[cfg_attr(feature = "servo", derive(HeapSizeOf))]
+-    pub struct SpecifiedValue(Vec<SpecifiedOperation>);
++    pub struct SpecifiedValue(pub Vec<SpecifiedOperation>);
+ 
+     impl ToCss for SpecifiedValue {
+         fn to_css<W>(&self, dest: &mut W) -> fmt::Result where W: fmt::Write {
+ 
+             if self.0.is_empty() {
+                 return dest.write_str("none")
+             }
+ 
+diff -r 5805d929bec9 components/style/properties/properties.mako.rs
+--- a/components/style/properties/properties.mako.rs	Thu Jul 27 11:07:29 2017 -0500
++++ b/components/style/properties/properties.mako.rs	Thu Jul 27 13:21:13 2017 -0700
+@@ -7,17 +7,17 @@
+ // Please note that valid Rust syntax may be mangled by the Mako parser.
+ // For example, Vec<&Foo> will be mangled as Vec&Foo>. To work around these issues, the code
+ // can be escaped. In the above example, Vec<<&Foo> or Vec< &Foo> achieves the desired result of Vec<&Foo>.
+ 
+ <%namespace name="helpers" file="/helpers.mako.rs" />
+ 
+ use servo_arc::{Arc, UniqueArc};
+ use std::borrow::Cow;
+-use std::collections::HashSet;
++use std::collections::{HashMap, HashSet};
+ use std::{fmt, mem, ops};
+ #[cfg(feature = "gecko")] use std::ptr;
+ 
+ use app_units::Au;
+ #[cfg(feature = "servo")] use cssparser::RGBA;
+ use cssparser::{Parser, TokenSerializationType, serialize_identifier};
+ use cssparser::ParserInput;
+ #[cfg(feature = "servo")] use euclid::SideOffsets2D;
+@@ -25,32 +25,35 @@ use computed_values;
+ use context::QuirksMode;
+ use error_reporting::NullReporter;
+ use font_metrics::FontMetricsProvider;
+ #[cfg(feature = "gecko")] use gecko_bindings::bindings;
+ #[cfg(feature = "gecko")] use gecko_bindings::structs::{self, nsCSSPropertyID};
+ #[cfg(feature = "servo")] use logical_geometry::{LogicalMargin, PhysicalSide};
+ use logical_geometry::WritingMode;
+ use media_queries::Device;
++use parking_lot::RwLock;
+ use parser::{Parse, ParserContext};
++use properties_and_values::RegisteredPropertySet;
+ use properties::animated_properties::AnimatableLonghand;
+ #[cfg(feature = "gecko")] use properties::longhands::system_font::SystemFont;
+ use selector_parser::PseudoElement;
+ use selectors::parser::SelectorParseError;
+ #[cfg(feature = "servo")] use servo_config::prefs::PREFS;
+ use shared_lock::StylesheetGuards;
+ use style_traits::{PARSING_MODE_DEFAULT, HasViewportPercentage, ToCss, ParseError};
+ use style_traits::{PropertyDeclarationParseError, StyleParseError};
+ use stylesheets::{CssRuleType, MallocSizeOf, MallocSizeOfFn, Origin, UrlExtraData};
+ #[cfg(feature = "servo")] use values::Either;
+ use values::generics::text::LineHeight;
+ use values::computed;
+ use cascade_info::CascadeInfo;
+ use rule_tree::{CascadeLevel, StrongRuleNode};
+ use self::computed_value_flags::ComputedValueFlags;
++use servo_url::ServoUrl;
+ use style_adjuster::StyleAdjuster;
+ #[cfg(feature = "servo")] use values::specified::BorderStyle;
+ 
+ pub use self::declaration_block::*;
+ 
+ #[cfg(feature = "gecko")]
+ #[macro_export]
+ macro_rules! property_name {
+@@ -779,17 +782,19 @@ pub enum DeclaredValue<'a, T: 'a> {
+ /// extra discriminant word) and synthesize dependent DeclaredValues for
+ /// PropertyDeclaration instances as needed.
+ #[derive(Clone, PartialEq, Eq, Debug)]
+ pub enum DeclaredValueOwned<T> {
+     /// A known specified value from the stylesheet.
+     Value(T),
+     /// An unparsed value that contains `var()` functions.
+     WithVariables(Arc<UnparsedValue>),
+-    /// An CSS-wide keyword.
++    /// A CSS-wide keyword.
++    /// Custom properties should not use the DeclaredValueOwned::WithVariables
++    /// variant (see the assert in ::custom_properties::cascade).
+     CSSWideKeyword(CSSWideKeyword),
+ }
+ 
+ impl<T> DeclaredValueOwned<T> {
+     /// Creates a dependent DeclaredValue from this DeclaredValueOwned.
+     fn borrow(&self) -> DeclaredValue<T> {
+         match *self {
+             DeclaredValueOwned::Value(ref v) => DeclaredValue::Value(v),
+@@ -2929,17 +2934,18 @@ pub fn cascade(
+     guards: &StylesheetGuards,
+     parent_style: Option<<&ComputedValues>,
+     parent_style_ignoring_first_line: Option<<&ComputedValues>,
+     layout_parent_style: Option<<&ComputedValues>,
+     visited_style: Option<Arc<ComputedValues>>,
+     cascade_info: Option<<&mut CascadeInfo>,
+     font_metrics_provider: &FontMetricsProvider,
+     flags: CascadeFlags,
+-    quirks_mode: QuirksMode
++    quirks_mode: QuirksMode,
++    registered_property_set: &RwLock<RegisteredPropertySet>,
+ ) -> Arc<ComputedValues> {
+     debug_assert_eq!(parent_style.is_some(), parent_style_ignoring_first_line.is_some());
+     #[cfg(feature = "gecko")]
+     debug_assert!(parent_style.is_none() ||
+                   ptr::eq(parent_style.unwrap(),
+                           parent_style_ignoring_first_line.unwrap()) ||
+                   parent_style.unwrap().pseudo() == Some(PseudoElement::FirstLine));
+     let iter_declarations = || {
+@@ -2989,35 +2995,278 @@ pub fn cascade(
+         parent_style,
+         parent_style_ignoring_first_line,
+         layout_parent_style,
+         visited_style,
+         cascade_info,
+         font_metrics_provider,
+         flags,
+         quirks_mode,
++        registered_property_set,
+     )
+ }
+ 
++fn compute_resolved_custom_property(
++    registered_property_set: &RegisteredPropertySet,
++    context: &computed::Context,
++    url_data: &UrlExtraData,
++    name: &::custom_properties::Name,
++    value: ::custom_properties::ComputedValue,
++) -> Result<::custom_properties::ComputedValue, ()> {
++    let registration = match registered_property_set.get(name) {
++        None => return Ok(value),
++        Some(registration) => registration
++    };
++    let specified = {
++        let reporter = NullReporter;
++        let parser_context = ParserContext::new(
++            Origin::Author,
++            url_data,
++            &reporter,
++            /* rule_type */ None,
++            PARSING_MODE_DEFAULT,
++            context.quirks_mode,
++        );
++        let mut input = ParserInput::new(&value.css);
++        let mut input = Parser::new(&mut input);
++        match registration.syntax.parse(&parser_context, &mut input) {
++            Ok(x) => x,
++            Err(_) => return Err(()),
++        }
++    };
++    specified.to_computed_value(context).map(|x| x.into())
++}
++
++fn compute_early_custom_properties<'a, 'b: 'a, I>(
++    context: &computed::Context,
++    inherited: &'a Option<Arc<::custom_properties::CustomPropertiesMap>>,
++    declarations: I,
++    registered_property_set: &RwLock<RegisteredPropertySet>,
++) -> (
++    Option<HashMap<<&'a ::custom_properties::Name,
++                    ::custom_properties::BorrowedSpecifiedValue<'a>>>,
++    Option<Arc<::custom_properties::CustomPropertiesMap>>,
++    bool
++)
++where I: Iterator<Item = (&'b PropertyDeclaration, CascadeLevel)>
++{
++    let registered_property_set = registered_property_set.read();
++
++    // Will be populated by ::custom_properties::cascade if any of the
++    // specified custom properties end up being used.
++    let mut specified = None;
++    // parse_declaration_value_block wants Options.
++    let mut referenced_by_font_size = Some(HashSet::new());
++    let mut referenced_by_other_early = Some(HashSet::new());
++    let mut possibly_font_size_dependent = HashSet::new();
++    let mut seen_custom = HashSet::new();
++    // Don't really need this, but parse_declaration_value_block expects it.
++    let mut missing_closing_characters = String::new();
++    for (declaration, _cascade_level) in declarations {
++        match *declaration {
++            PropertyDeclaration::Custom(ref name, ref value) => {
++                ::custom_properties::cascade(
++                    &mut specified,
++                    &inherited,
++                    /* handle_keyword */ |name, keyword| {
++                        use ::custom_properties::KeywordAction;
++                        match keyword {
++                            CSSWideKeyword::Initial => {
++                                if let Some(registration) = registered_property_set.get(name) {
++                                    if registration.initial_value.is_some() {
++                                        KeywordAction::UseInitial
++                                    } else {
++                                        KeywordAction::Remove
++                                    }
++                                } else {
++                                    KeywordAction::Remove
++                                }
++                            },
++                            CSSWideKeyword::Inherit => ::custom_properties::KeywordAction::Inherit,
++                            CSSWideKeyword::Unset => {
++                                if let Some(registration) = registered_property_set.get(name) {
++                                    if registration.inherits {
++                                        KeywordAction::Inherit
++                                    } else if registration.initial_value.is_some() {
++                                        KeywordAction::UseInitial
++                                    } else {
++                                        KeywordAction::Remove
++                                    }
++                                } else {
++                                    KeywordAction::Inherit
++                                }
++                            },
++                        }
++                    },
++                    &mut seen_custom,
++                    name,
++                    value.borrow()
++                );
++                if let Some(registration) = registered_property_set.get(name) {
++                    if let ::properties_and_values::Syntax::Disjunction(ref terms) = registration.syntax {
++                        use ::properties_and_values::{Term, Type};
++                        if terms.iter().any(|&Term { ref typ, .. }| {
++                            match *typ {
++                                Type::Length | Type::LengthPercentage |
++                                Type::TransformList => true,
++                                _ => false,
++                            }
++                        }) {
++                            possibly_font_size_dependent.insert(name.clone());
++                        }
++                    }
++                }
++            },
++            PropertyDeclaration::WithVariables(id, ref value) if id.is_early_property() => {
++                let mut referenced_by = if id == LonghandId::FontSize {
++                    &mut referenced_by_font_size
++                } else {
++                    &mut referenced_by_other_early
++                };
++                let mut input = ParserInput::new(&value.css);
++                let mut input = Parser::new(&mut input);
++                // We're just going to use parse_declaration_value_block to grab
++                // references.
++                let _ = ::custom_properties::parse_declaration_value_block(
++                    &mut input,
++                    &mut referenced_by,
++                    &mut missing_closing_characters,
++                );
++            },
++            _ => (),
++        }
++    }
++
++    let referenced_by_font_size = referenced_by_font_size.unwrap();
++    let referenced_by_other_early = referenced_by_other_early.unwrap();
++
++    let phony_url = ServoUrl::parse("http://example.com").unwrap();
++
++    // Remove cycles and compute those custom properties depended on by early
++    // properties.
++    let (computed_early, font_size_cyclical) = {
++        if let Some(ref mut specified) = specified {
++            let (font_size_cyclical, dependencies, cyclical) = {
++                ::custom_properties::analyze_dependencies(
++                    specified,
++                    &referenced_by_font_size,
++                    &referenced_by_other_early,
++                    &possibly_font_size_dependent,
++                )
++            };
++
++            // Note that inherited properties will have already been inserted
++            // into `specified` by ::custom_properties::cascade.
++            // If a property isn't specified and is either
++            // a) uninherited or has no inherited value, and
++            // b) has an initial value,
++            // then we should set it to its initial value.
++            let mut computed = {
++                let has_value = specified.iter().map(|(name, _)| name.clone()).collect();
++                registered_property_set.initial_values_except(Some(&has_value))
++            };
++
++            for name in cyclical {
++                specified.remove(&name);
++                // "If there is a cycle in the dependency graph, all the custom
++                //  properties in the cycle must compute to their initial value
++                //  (which is a guaranteed-invalid value)."
++                // -- https://drafts.csswg.org/css-variables/#cycles
++                let initial_value =
++                    registered_property_set
++                    .get(&name)
++                    .and_then(|registration| registration.initial_value.clone())
++                    .map(|initial_value| initial_value.into());
++                if let Some(initial_value) = initial_value {
++                    computed.insert(&name, initial_value)
++                }
++            }
++
++            ::custom_properties::substitute_all(
++                specified,
++                &Some(dependencies),
++                /*&inherited,*/
++                &mut computed,
++                /* compute */ &|name, value| {
++                    compute_resolved_custom_property(
++                        &*registered_property_set,
++                        context,
++                        // The second unwrap will fail if this
++                        // BorrowedSpecifiedValue came from an inherited
++                        // declaration. Inherited declarations should
++                        // already have been computed if necessary.
++                        specified.get(name).unwrap()
++                                 .url_data.unwrap_or(&phony_url),
++                        name,
++                        value,
++                    )
++                },
++                /* handle_invalid */ &|name| {
++                    registered_property_set
++                        .get(name)
++                        .and_then(|registration| {
++                            if !registration.inherits {
++                                registration.initial_value.clone().map(|x| x.into())
++                            } else {
++                                None
++                            }
++                        })
++                        .or_else(|| inherited.as_ref().and_then(|x| x.get_computed_value(name).cloned()))
++                        .ok_or(())
++                }
++            );
++
++            (Some(Arc::new(computed)), font_size_cyclical)
++        } else if let &Some(ref inherited) = inherited {
++            let uninherited_properties = registered_property_set.uninherited_properties();
++            if !uninherited_properties.is_empty() {
++                let mut computed = ::custom_properties::CustomPropertiesMap::new();
++                for (name, value) in inherited.iter() {
++                    if !uninherited_properties.contains(name) {
++                        computed.insert(name, (*value).clone());
++                    } else {
++                        let registration = registered_property_set.get(name).unwrap();
++                        if let Some(ref initial) = registration.initial_value {
++                            computed.insert(name, (*initial).clone().into());
++                        }
++                    }
++                }
++                (Some(Arc::new(computed)), false)
++            } else {
++                // Arc, so should be cheap.
++                (Some((*inherited).clone()), false)
++            }
++        } else {
++            // No inherited or specified values.
++            // If there are any properties with initial values, we should set
++            // them.
++            (Some(Arc::new(registered_property_set.initial_values_except(None))), false)
++        }
++    };
++
++    (specified, computed_early, font_size_cyclical)
++}
++
+ /// NOTE: This function expects the declaration with more priority to appear
+ /// first.
+ #[allow(unused_mut)] // conditionally compiled code for "position"
+ pub fn apply_declarations<'a, F, I>(
+     device: &Device,
+     pseudo: Option<<&PseudoElement>,
+     rules: &StrongRuleNode,
+     iter_declarations: F,
+     parent_style: Option<<&ComputedValues>,
+     parent_style_ignoring_first_line: Option<<&ComputedValues>,
+     layout_parent_style: Option<<&ComputedValues>,
+     visited_style: Option<Arc<ComputedValues>>,
+     mut cascade_info: Option<<&mut CascadeInfo>,
+     font_metrics_provider: &FontMetricsProvider,
+     flags: CascadeFlags,
+     quirks_mode: QuirksMode,
++    registered_property_set: &RwLock<RegisteredPropertySet>,
+ ) -> Arc<ComputedValues>
+ where
+     F: Fn() -> I,
+     I: Iterator<Item = (&'a PropertyDeclaration, CascadeLevel)>,
+ {
+     debug_assert!(layout_parent_style.is_none() || parent_style.is_some());
+     debug_assert_eq!(parent_style.is_some(), parent_style_ignoring_first_line.is_some());
+     #[cfg(feature = "gecko")]
+@@ -3031,56 +3280,61 @@ where
+              layout_parent_style.unwrap_or(parent_style))
+         },
+         None => {
+             (device.default_computed_values(),
+              device.default_computed_values())
+         }
+     };
+ 
+-    let inherited_custom_properties = inherited_style.custom_properties();
+-    let mut custom_properties = None;
+-    let mut seen_custom = HashSet::new();
+-    for (declaration, _cascade_level) in iter_declarations() {
+-        if let PropertyDeclaration::Custom(ref name, ref value) = *declaration {
+-            ::custom_properties::cascade(
+-                &mut custom_properties, &inherited_custom_properties,
+-                &mut seen_custom, name, value.borrow());
+-        }
+-    }
+-
+-    let custom_properties =
+-        ::custom_properties::finish_cascade(
+-            custom_properties, &inherited_custom_properties);
+-
+     let mut context = computed::Context {
+         is_root_element: flags.contains(IS_ROOT_ELEMENT),
+         // We'd really like to own the rules here to avoid refcount traffic, but
+         // animation's usage of `apply_declarations` make this tricky. See bug
+         // 1375525.
+         builder: StyleBuilder::new(
+             device,
+             parent_style,
+             parent_style_ignoring_first_line,
+             pseudo,
+             flags,
+             Some(rules.clone()),
+-            custom_properties,
++            // We need the context to finish computing these; then we'll fill
++            // them in.
++            /* custom_properties */ None,
+             WritingMode::empty(),
+             inherited_style.font_computation_data.font_size_keyword,
+             ComputedValueFlags::empty(),
+             visited_style,
+         ),
+         font_metrics_provider: font_metrics_provider,
+         cached_system_font: None,
+         in_media_query: false,
+         quirks_mode: quirks_mode,
+         for_smil_animation: false,
+     };
+ 
++    let inherited_custom_properties = inherited_style.custom_properties();
++    let (
++        specified_custom_properties,
++        mut computed_custom_properties,
++        font_size_cyclical
++    ) = {
++        compute_early_custom_properties(
++            &context,
++            &inherited_custom_properties,
++            iter_declarations(),
++            registered_property_set,
++        )
++    };
++
++    // Should be enough to resolve early properties. Need to fill in the other
++    // ones later.
++    context.builder.custom_properties = computed_custom_properties;
++
+     let ignore_colors = !device.use_document_colors();
+     let default_background_color_decl = if ignore_colors {
+         let color = device.default_background_color();
+         Some(PropertyDeclaration::BackgroundColor(color.into()))
+     } else {
+         None
+     };
+ 
+@@ -3098,16 +3352,79 @@ where
+     // virtual dispatch instead.
+     % for category_to_cascade_now in ["early", "other"]:
+         % if category_to_cascade_now == "early":
+             // Pull these out so that we can compute them in a specific order
+             // without introducing more iterations.
+             let mut font_size = None;
+             let mut font_family = None;
+         % endif
++        %if category_to_cascade_now == "other":
++            // Oh goody! Now we can compute the other custom properties that
++            // weren't depended on by early properties and that might have
++            // depended on them.
++
++            if context.builder.custom_properties.is_some() && specified_custom_properties.is_some() {
++                // Swap out context.builder.custom_properties temporarily so we
++                // can update it. (We still need to pass context in to compute
++                // with). We'll swap it back in at the end!
++                let mut maybe_arc = None;
++                mem::swap(&mut maybe_arc, &mut context.builder.custom_properties);
++
++                {
++                    let mut arc = maybe_arc.as_mut().unwrap();
++                    let mut computed_custom_properties = Arc::get_mut(arc).unwrap();
++
++                    let specified_custom_properties = specified_custom_properties.as_ref().unwrap();
++                    let registered_property_set = registered_property_set.read();
++
++                    let phony_url = ServoUrl::parse("http://example.com").unwrap();
++
++                    // XXX when can context.builder.custom_properties be Some yet
++                    // specified is None?
++
++                    ::custom_properties::substitute_all(
++                        specified_custom_properties,
++                        // Compute everybody that isn't yet computed.
++                        /* to_substitute */ &None,
++                        /* &inherited_custom_properties, */
++                        computed_custom_properties,
++                        /* compute */ &mut |name, value| {
++                            compute_resolved_custom_property(
++                                &*registered_property_set,
++                                &context,
++                                specified_custom_properties.get(name).unwrap()
++                                                           .url_data.unwrap_or(&phony_url),
++                                name,
++                                value
++                            )
++                        },
++                        /* handle_invalid */ &|name| {
++                            registered_property_set
++                                .get(name)
++                                .and_then(|registration| {
++                                    if !registration.inherits {
++                                        registration.initial_value.clone().map(|x| x.into())
++                                    } else {
++                                        None
++                                    }
++                                })
++                                .or_else(|| {
++                                    inherited_custom_properties
++                                        .as_ref()
++                                        .and_then(|x| x.get_computed_value(name).cloned())
++                                })
++                                .ok_or(())
++                        }
++                    );
++                }
++
++                mem::swap(&mut maybe_arc, &mut context.builder.custom_properties);
++            }
++        % endif
+         for (declaration, cascade_level) in iter_declarations() {
+             let mut declaration = match *declaration {
+                 PropertyDeclaration::WithVariables(id, ref unparsed) => {
+                     Cow::Owned(unparsed.substitute_variables(
+                         id,
+                         &context.builder.custom_properties,
+                         context.quirks_mode
+                     ))
+@@ -3115,16 +3432,20 @@ where
+                 ref d => Cow::Borrowed(d)
+             };
+ 
+             let longhand_id = match declaration.id() {
+                 PropertyDeclarationId::Longhand(id) => id,
+                 PropertyDeclarationId::Custom(..) => continue,
+             };
+ 
++            if font_size_cyclical && longhand_id == LonghandId::FontSize {
++                continue
++            }
++
+             // Only a few properties are allowed to depend on the visited state
+             // of links.  When cascading visited styles, we can save time by
+             // only processing these properties.
+             if flags.contains(VISITED_DEPENDENT_ONLY) &&
+                !longhand_id.is_visited_dependent() {
+                 continue
+             }
+ 
+diff -r 5805d929bec9 components/style/properties_and_values.rs
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/components/style/properties_and_values.rs	Thu Jul 27 13:21:13 2017 -0700
+@@ -0,0 +1,882 @@
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#![allow(missing_docs, warnings)]
++
++//! Support for the [Properties & Values API][spec].
++//!
++//! [spec]: https://drafts.css-houdini.org/css-properties-values-api-1/
++
++use app_units::Au;
++use Atom;
++use cssparser::{BasicParseError, Delimiter, ParseError, ParserInput, Parser, Token};
++use custom_properties::{self, CustomPropertiesMap, Name};
++use parser::{Parse, ParserContext};
++use properties::longhands::transform;
++use properties::{CSSWideKeyword};
++use servo_url::ServoUrl;
++use selectors::parser::SelectorParseError;
++use std::collections::{HashMap, HashSet};
++use std::fmt;
++use std::ops::Deref;
++use std::vec::Vec;
++use style_traits::{ParseError as StyleTraitsParseError, StyleParseError};
++use style_traits::values::{OneOrMoreSeparated, Space, ToCss};
++use style_traits::values::specified::AllowedLengthType;
++use values;
++use values::computed::{self, ComputedValueAsSpecified, ToComputedValue};
++use values::specified;
++
++/// A registration for a custom property.
++#[derive(HeapSizeOf)]
++pub struct Registration {
++    /// The custom property name, sans leading '--'.
++    pub name: Name,
++    /// The syntax of the custom property.
++    pub syntax: Syntax,
++    /// Whether the custom property is inherited down the DOM tree.
++    pub inherits: bool,
++    /// The initial value of the custom property.
++    /// Ideally we'd merge this with `syntax` so that illegal states would be
++    /// unrepresentable. But while we could do that by turning the fields of
++    /// the SpecifiedVariableLength variants into Option<T>'s, we would need a
++    /// more expressive type system to do this with disjunctions.
++    pub initial_value: Option<ComputedValue>,
++}
++
++/// A versioned set of registered custom properties, stored on the document.
++/// The [[registeredPropertySet]] of the spec. We keep track of the version to
++/// know if we need to recompute which declarations are valid.
++#[derive(Default, HeapSizeOf)]
++pub struct RegisteredPropertySet {
++    /// The set of registered custom properties. Names are sans leading '--'.
++    registrations: HashMap<Name, Registration>,
++    /// The current version. Must be incremented whenever `registrations` is
++    /// modified.
++    generation: u32,
++}
++
++impl RegisteredPropertySet {
++    pub fn register_property(&mut self, registration: Registration) -> Result<(), ()> {
++        match self.registrations.insert(registration.name.clone(), registration) {
++            Some(_) => Err(()),
++            None => {
++                self.generation += 1;
++                Ok(())
++            }
++        }
++    }
++
++    pub fn unregister_property(&mut self, name: &Name) -> Result<(), ()> {
++        match self.registrations.remove(name) {
++            Some(_) => {
++                self.generation += 1;
++                Ok(())
++            },
++            None => Err(())
++        }
++    }
++
++    pub fn generation(&self) -> u32 {
++        self.generation
++    }
++
++    pub fn get(&self, name: &Name) -> Option<&Registration> {
++        self.registrations.get(name)
++    }
++
++    // XXX cache
++    pub fn uninherited_properties(&self) -> HashSet<&Name> {
++        self.registrations
++            .iter()
++            .filter(|&(_, registration)| !registration.inherits)
++            .map(|(name, _)| name)
++            .collect()
++    }
++
++    // XXX cache
++    pub fn initial_values_except(&self, except: Option<&HashSet<&Name>>) -> CustomPropertiesMap {
++        let mut map = CustomPropertiesMap::new();
++        for (name, registration) in self.registrations.iter() {
++            if except.map(|x| x.contains(name)).unwrap_or(false) {
++                continue
++            }
++            if let Some(ref initial) = registration.initial_value {
++                map.insert(name, initial.clone().into());
++            }
++        }
++        map
++    }
++}
++
++// We make a newtype for Atom and implement ToCss ourselves because the
++// ToCss implementation for atom in `style_traits::values` uses `cssparsers`'s
++// `serialize_string` function, which writes a double-quoted CSS string. We're
++// only storing <custom-idents>, which should be serialized as specified.
++
++#[derive(Clone, Debug, HeapSizeOf, PartialEq)]
++pub struct Ident(pub Atom);
++
++impl ComputedValueAsSpecified for Ident {}
++
++impl ToCss for Ident {
++    fn to_css<W>(&self, dest: &mut W) -> fmt::Result where W: fmt::Write {
++        dest.write_str(&*self)
++    }
++}
++
++impl Deref for Ident {
++    type Target = Atom;
++
++    fn deref(&self) -> &Atom {
++        &self.0
++    }
++}
++
++// We need to output the resolved URL.
++
++#[derive(Clone, Debug, HeapSizeOf)]
++pub struct ComputedUrl(pub String);
++
++impl ComputedUrl {
++    #[cfg(feature = "servo")]
++    fn from_specified(url: &specified::url::SpecifiedUrl) -> Result<ComputedUrl, ()> {
++        url.url().map(|x| ComputedUrl(x.as_str().to_owned())).ok_or(())
++    }
++
++    #[cfg(feature = "gecko")]
++    fn from_specified(url: &specified::url::SpecifiedUrl) -> Result<ComputedUrl, ()> {
++        url.extra_data.join(url.as_str()).map(|x| ComputedUrl(x.as_str().to_owned())).ok_or(())
++    }
++}
++
++impl ToCss for ComputedUrl {
++    fn to_css<W>(&self, dest: &mut W) -> fmt::Result where W: fmt::Write {
++        dest.write_str("url(")?;
++        self.0.to_css(dest)?;
++        dest.write_str(")")
++    }
++}
++
++/// A basic custom property syntax string for a custom property that, used to
++/// build up disjunctions and list terms.
++#[derive(Debug, HeapSizeOf, PartialEq)]
++pub enum Type {
++    /// Syntax to allow any valid <length> value.
++    Length,
++    /// Syntax to allow any valid <number> value.
++    Number,
++    /// Syntax to allow any valid <percentage> value.
++    Percentage,
++    /// Syntax to allow any valid <length> or <percentage> value, or any valid
++    /// <calc()> expression combining <length> and <percentage> components.
++    LengthPercentage,
++    /// Syntax to allow any valid <color> value.
++    Color,
++    /// Syntax to allow any valid <image> value.
++    Image,
++    /// Syntax to allow any valid <url> value.
++    Url,
++    /// Syntax to allow any valid <integer> value.
++    Integer,
++    /// Syntax to allow any valid <angle> value.
++    Angle,
++    /// Syntax to allow any valid <time> value.
++    Time,
++    ///// Syntax to allow any valid <resolution> value.
++    //Resolution,
++    /// Syntax to allow any valid <transform-list> value.
++    TransformList,
++    /// Syntax to allow any valid <custom-ident> value.
++    CustomIdent,
++    /// Syntax to allow a specific identifier (matching the <custom-ident>
++    /// production, compared codepoint-wise).
++    SpecificIdent(Ident),
++}
++
++impl Type {
++    /// In the case of transform functions, we always return a list.
++    /// Caller should check whether a list is expected.
++    pub fn parse<'i, 't>(
++        &self,
++        context: &ParserContext,
++        input: &mut Parser<'i, 't>
++    ) -> Result<SpecifiedValueItem, StyleTraitsParseError<'i>>
++    {
++        macro_rules! parse {
++            ($_self:expr, $context:expr, $input:expr,
++
++             $($typ:ident => $fn:path),*) => {
++                match $_self {
++                    $(
++                        Type::$typ => {
++                            $fn(context, input).map(|x| {
++                                SpecifiedValueItem::$typ(x)
++                            })
++                        }
++                    ),*
++
++                    // We need to actually compare SpecificIdents,
++                    // unfortunately.
++                    Type::SpecificIdent(ref x) => {
++                        $input.expect_ident_cloned().and_then(|y| {
++                            if ***x == *y {
++                                Ok(SpecifiedValueItem::SpecificIdent(x.clone()))
++                            } else {
++                                Err(BasicParseError::UnexpectedToken(Token::Ident(y)).into())
++                            }
++                        }).map_err(|e| e.into())
++                    },
++                }
++            };
++        }
++
++        fn parse_custom_ident<'i, 't>(
++            context: &ParserContext,
++            input: &mut Parser<'i, 't>
++        ) -> Result<Ident, StyleTraitsParseError<'i>> {
++            // Don't allow CSS-wide keywords: these should have been handled by
++            // whoever is parsing the declaration.
++            input.expect_ident_cloned()
++                 .and_then(|x| {
++                     match CSSWideKeyword::from_ident(&x) {
++                         Some(_) => Err(BasicParseError::UnexpectedToken(Token::Ident(x))),
++                         None => Ok(Ident((*x).into())),
++                     }
++                 })
++                 .map_err(|e| e.into())
++        }
++
++        parse! {
++            *self, context, input,
++
++            Length => specified::Length::parse,
++            Number => specified::Number::parse,
++            Percentage => specified::Percentage::parse,
++            LengthPercentage => specified::LengthOrPercentage::parse,
++            Color => specified::Color::parse,
++            Image => specified::Image::parse,
++            Url => specified::url::SpecifiedUrl::parse,
++            Integer => specified::Integer::parse,
++            Angle => specified::Angle::parse,
++            Time => specified::Time::parse,
++            TransformList => transform::parse,
++            CustomIdent => parse_custom_ident
++        }
++    }
++}
++
++
++/// A custom property syntax string that is either some basic syntax string
++/// (e.g. some <url> value) or some list term. A list term syntax string allows
++/// a space-separated list of one or more repetitions of the type specified by
++/// the string. Used to build up disjunctions.
++#[derive(Debug, HeapSizeOf, PartialEq)]
++pub struct Term {
++    pub typ: Type,
++    pub list: bool,
++}
++
++/// A custom property syntax string.
++#[derive(Debug, HeapSizeOf, PartialEq)]
++pub enum Syntax {
++    /// Syntax to allow any token stream (written '*').
++    Anything,
++    /// Syntax to allow some disjunction of terms (possibly list terms), which
++    /// allows any value matching one of the items in the combination, matched
++    /// in specified order (written 'a | b | ...').
++    Disjunction(Vec<Term>),
++}
++
++impl Syntax {
++    /// Parse a syntax string given to `CSS.registerProperty`.
++    pub fn from_string(input: &str) -> Result<Syntax, ()> {
++        // Syntax strings are DOMStrings, but in Servo we assume they are valid
++        // UTF-8. See
++        // https://doc.servo.org/script/dom/bindings/str/struct.DOMString.html
++        // . This justifies iteration by |char|.
++
++        // Can identifiers in syntax strings contain escapes? No.
++        //
++        // "Currently the answer is no - I've clarified the "literal ident"
++        //  part to be specifically a name-start char followed by 0+ name chars.
++        //  Would prefer to avoid having to do CSS parsing on the syntax string.
++        //  ^_^"
++        // https://github.com/w3c/css-houdini-drafts/issues/112
++        //
++        // A 'specific ident' is any sequence consisting of a name-start code
++        // point, followed by zero
++        // or more name code points, which matches the <custom-ident>
++        // production
++        // https://drafts.css-houdini.org/css-properties-values-api-1/#supported-syntax-strings
++        //
++        // ...
++        // This generic data type is denoted by <custom-ident>, and represents
++        // any valid CSS identifier that would not be misinterpreted as a
++        // pre-defined keyword in that property’s value definition.
++        // https://drafts.csswg.org/css-values-4/#identifier-value
++        //
++        // So! In order to make sure specific identifiers don't contain
++        // escapes, we need to check for escapes, which are only introduced by
++        // backslashes, which shouldn't show up anyhow.
++        // https://drafts.csswg.org/css-syntax-3/#escaping
++        let mut contains_backslash = false;
++        for c in input.chars() {
++            if c == '\\' {
++                contains_backslash = true;
++                break
++            }
++        }
++        if contains_backslash {
++            return Err(())
++        }
++
++        // The parsed syntax string, which we'll build up as we scan tokens.
++        let mut syntax = None;
++
++        // The syntax string isn't really CSS, but hopefully this maximizes
++        // code reuse.
++        let mut parser_input = ParserInput::new(input);
++        let mut parser = Parser::new(&mut parser_input);
++
++        #[derive(Debug)]
++        enum State {
++            // *.
++            AfterAsterisk,
++            // <.
++            AfterOpenAngle,
++            // +.
++            AfterPlus,
++            // <type>.
++            // ident.
++            AfterType { after_whitespace: bool },
++            // <type.
++            AfterTypeName,
++            // .
++            // |.
++            Start { after_bar: bool },
++        }
++
++        let mut state = State::Start { after_bar: false };
++
++        /// Add a `Type` to the disjunction. It might turn out this is a list
++        /// term, in which case we'll modify the `Term` later.
++        fn push_type(syntax: &mut Option<Syntax>, t: Type) {
++            if let Some(Syntax::Disjunction(ref mut ts)) = *syntax {
++                ts.push(Term { typ: t, list: false })
++            } else { unreachable!() }
++        }
++
++        /// Signal that we expect to be parsing some term in a disjunction.
++        fn expect_disjunction(syntax: &mut Option<Syntax>) {
++            if let Some(Syntax::Disjunction(_)) = *syntax {
++                // Good!
++            } else {
++                assert!(*syntax == None);
++                *syntax = Some(Syntax::Disjunction(vec![]))
++            }
++        }
++
++        /// Handle the next token in the syntax string (including whitespace).
++        fn handle_token(syntax: &mut Option<Syntax>, state: State, token: &Token) -> Result<State, ()> {
++            debug!("{:?} - {:?}", state, token);
++            match (state, token) {
++                (_, &Token::Comment(_)) => Err(()),
++
++                (State::Start { .. }, &Token::WhiteSpace(_)) => {
++                    // Ignore whitespace.
++                    Ok(State::Start { after_bar: false })
++                },
++                (State::Start { after_bar: false }, &Token::Delim('*')) => {
++                    // If we see a '*', that should be it (modulo whitespace).
++                    if syntax != &None {
++                        Err(())
++                    } else {
++                        *syntax = Some(Syntax::Anything);
++                        Ok(State::AfterAsterisk)
++                    }
++                },
++                (State::Start { .. }, &Token::Delim('<')) => {
++                    // A '<' should mean we're in the start of a '<type>'.
++                    expect_disjunction(syntax);
++                    Ok(State::AfterOpenAngle)
++                },
++                (State::Start { .. }, &Token::Ident(ref id)) => {
++                    // An identifier by itself should mean we're about to see a
++                    // specific identifier. Note that for <custom-idents> we
++                    // have that they "[must] not be misinterpreted as a
++                    // pre-defined keyword in that property’s value
++                    // definition". Here that means CSS-wide keywords!
++                    expect_disjunction(syntax);
++                    match CSSWideKeyword::from_ident(id) {
++                        Some(_) => Err(()),
++                        None => {
++                            push_type(syntax, Type::SpecificIdent(Ident((**id).into())));
++                            Ok(State::AfterType { after_whitespace: false })
++                        }
++                    }
++                },
++                (State::Start { .. }, _) => Err(()),
++
++                (State::AfterOpenAngle, &Token::Ident(ref id)) => {
++                    // We should be in something like '<length>' here.
++                    // https://drafts.css-houdini.org/css-properties-values-api/#supported-syntax-strings
++                    push_type(syntax, match &**id {
++                        "length" => Type::Length,
++                        "number" => Type::Number,
++                        "percentage" => Type::Percentage,
++                        "length-percentage" => Type::LengthPercentage,
++                        "color" => Type::Color,
++                        "image" => Type::Image,
++                        "url" => Type::Url,
++                        "integer" => Type::Integer,
++                        "angle" => Type::Angle,
++                        "time" => Type::Time,
++                        //"resolution" => Type::Resolution,
++                        "transform-list" => Type::TransformList,
++                        "custom-ident" => Type::CustomIdent,
++                        _ => return Err(())
++                    });
++                    Ok(State::AfterTypeName)
++                },
++                (State::AfterOpenAngle, _) => Err(()),
++
++                (State::AfterTypeName, &Token::Delim('>')) => {
++                    // This should be the end of something like '<length>'.
++                    Ok(State::AfterType { after_whitespace: false })
++                },
++                (State::AfterTypeName, _) => Err(()),
++
++                (State::AfterType { .. }, &Token::WhiteSpace(_)) => {
++                    // Ignore whitespace.
++                    Ok(State::AfterType { after_whitespace: true })
++                },
++                (State::AfterType { after_whitespace: false }, &Token::Delim('+')) => {
++                    // We should be following some type.
++                    // We should panic if we're not, because we should only get
++                    // here from Start -> AfterOpenAngle -> AfterTypeName (in
++                    // the case of something like '<length>') or
++                    // Start (in the case of something like 'my-ident'), both
++                    // of which should have pushed a type.
++                    if let Some(Syntax::Disjunction(ref mut ts)) = *syntax {
++                        let term = &mut ts.last_mut().unwrap();
++                        if term.typ == Type::TransformList {
++                            // <transform-list>+ is specifically disallowed.
++                            return Err(())
++                        }
++                        term.list = true
++                    } else { unreachable!() }
++                    Ok(State::AfterPlus)
++                },
++                (State::AfterType { .. }, &Token::Delim('|')) => {
++                    // Some other term in the disjunction should follow.
++                    Ok(State::Start { after_bar: true })
++                },
++                (State::AfterType { .. }, _) => Err(()),
++
++                (State::AfterAsterisk, &Token::WhiteSpace(_)) => Ok(State::AfterAsterisk),
++                (State::AfterAsterisk, _) => Err(()),
++                (State::AfterPlus, &Token::WhiteSpace(_)) => Ok(State::AfterPlus),
++                (State::AfterPlus, &Token::Delim('|')) => {
++                    // Some other term in the disjunction should follow.
++                    Ok(State::Start { after_bar: true })
++                }
++                (State::AfterPlus, _) => Err(()),
++            }
++        }
++
++        // Loop over all of the tokens in the syntax string.
++        loop {
++            match parser.next_including_whitespace_and_comments() {
++                Err(BasicParseError::EndOfInput) => {
++                    match state {
++                        State::Start { after_bar: false } |
++                        State::AfterType { .. } |
++                        State::AfterAsterisk |
++                        State::AfterPlus => break,
++
++                        // We shouldn't reach EOF in the middle of something.
++                        State::Start { after_bar: true } |
++                        State::AfterOpenAngle |
++                        State::AfterTypeName => return Err(())
++                    }
++                },
++                Err(_) => return Err(()),
++                Ok(token) => {
++                    match handle_token(&mut syntax, state, token) {
++                        Ok(s) => state = s,
++                        Err(()) => return Err(())
++                    }
++                }
++            }
++        }
++
++        syntax.ok_or(())
++    }
++
++    /// Parse some value following this syntax.
++    /// It's the responsibility of the caller to appropriately delimit the
++    /// input, and to make sure that the expected amount of input was consumed.
++    /// This should accordingly be called with a delimited parser.
++    /// This is a difference from the `parse` function provided by the `Parse`
++    /// trait, along with the fact that this returns a `SpecifiedValue`
++    /// rather than `Self`.
++    pub fn parse<'i, 't>(
++        &self,
++        context: &ParserContext,
++        input: &mut Parser<'i, 't>
++    ) -> Result<SpecifiedValue, StyleTraitsParseError<'i>>
++    {
++        let start = input.position();
++        match *self {
++            Syntax::Anything => {
++                // Don't allow CSS-wide keywords: these should have been handled by
++                // whoever is parsing the declaration.
++                custom_properties::SpecifiedValue::parse(context, input)
++                    .and_then(|x| {
++                        match CSSWideKeyword::from_ident(&x.css) {
++                            Some(_) => Err(BasicParseError::UnexpectedToken(Token::Ident(x.css.into())).into()),
++                            None => Ok(SpecifiedValue::Item(SpecifiedValueItem::TokenStream(*x)))
++                        }
++                    })
++            },
++            Syntax::Disjunction(ref terms) => {
++                for term in terms {
++                    if term.list {
++                        let mut outputs = Vec::new();
++                        loop {
++                            // TODO(jyc) Extend parse_until_before to take
++                            // space as a delimiter?
++                            match term.typ.parse(context, input) {
++                                Err(_) => break,
++                                Ok(x) => outputs.push(x)
++                            }
++                            // Need at least one.
++                            if input.is_exhausted() {
++                                return Ok(SpecifiedValue::List(outputs))
++                            }
++                            if let Err(_) = input.expect_whitespace() {
++                                break
++                            }
++                        }
++                    } else {
++                        // If we fail to parse, try again!
++                        if let Ok(x) = term.typ.parse(context, input) {
++                            return Ok(SpecifiedValue::Item(x))
++                        }
++                    }
++                    input.reset(start.clone())
++                }
++                Err(ParseError::Custom(SelectorParseError::Custom(StyleParseError::UnspecifiedError)))
++            },
++        }
++    }
++}
++
++#[derive(Clone, HeapSizeOf, ToCss)]
++pub enum SpecifiedValueItem {
++    Length(specified::Length),
++    Number(specified::Number),
++    Percentage(specified::Percentage),
++    LengthPercentage(specified::LengthOrPercentage),
++    Color(specified::Color),
++    Image(specified::Image),
++    // need tocss Url(SpecifiedUrl),
++    Url(specified::url::SpecifiedUrl),
++    Integer(specified::Integer),
++    Angle(specified::Angle),
++    Time(specified::Time),
++    // Not in Servo yet?
++    //Resolution(specified::Resolution),
++    TransformList(transform::SpecifiedValue),
++    CustomIdent(Ident),
++    SpecificIdent(Ident),
++    TokenStream(custom_properties::SpecifiedValue),
++}
++
++impl OneOrMoreSeparated for SpecifiedValueItem {
++    type S = Space;
++}
++
++impl SpecifiedValueItem {
++    /// Whether or not this specified value is computationally independent, that
++    /// is, 'if it can be converted into a computed value using only the value
++    /// of the property on the element, and "global" information that cannot be
++    /// changed by CSS.'
++    /// This seems to be only font relative units.
++    /// https://drafts.css-houdini.org/css-properties-values-api-1/#computationally-independent
++    pub fn is_computationally_independent(&self) -> bool {
++        use self::specified::{CalcLengthOrPercentage, Length, LengthOrPercentage, LengthOrPercentageOrNumber,
++                              NoCalcLength};
++        use self::transform::SpecifiedOperation;
++        use self::values::Either::*;
++        use self::values::generics::transform::Matrix;
++
++        fn check_no_calc_length(length: &NoCalcLength) -> bool {
++            match *length {
++                NoCalcLength::Absolute(_) => true,
++                // XXX 0em should be computationally independent.
++                NoCalcLength::FontRelative(_) => false,
++                NoCalcLength::ViewportPercentage(_) => true,
++                NoCalcLength::ServoCharacterWidth(_) => false,
++            }
++        }
++
++        fn check_calc(calc: &Box<CalcLengthOrPercentage>) -> bool {
++            for part in &[&(**calc).em, &(**calc).ex, &(**calc).ch, &(**calc).rem] {
++                match **part {
++                    None | Some(0.0) => (),
++                    Some(_) => return false,
++                }
++            }
++            true
++        }
++
++        fn check_length(length: &Length) -> bool {
++            match *length {
++                Length::NoCalc(ref length) => check_no_calc_length(length),
++                Length::Calc(ref calc) => check_calc(calc),
++            }
++        }
++
++        fn check_length_or_percentage(length_or_percentage: &LengthOrPercentage) -> bool {
++            match *length_or_percentage {
++                LengthOrPercentage::Length(ref length) => check_no_calc_length(length),
++                LengthOrPercentage::Percentage(_) => true,
++                LengthOrPercentage::Calc(ref calc) => check_calc(calc),
++            }
++        }
++
++        fn check_lo_po_number(lo_po_number: &LengthOrPercentageOrNumber) -> bool {
++            match *lo_po_number {
++                First(_) => true,
++                Second(ref length_or_percentage) => check_length_or_percentage(length_or_percentage),
++            }
++        }
++
++        fn check_transform_list(transform_list: &transform::SpecifiedValue) -> bool {
++            transform_list.0.iter().all(|operation| {
++                match *operation {
++                    SpecifiedOperation::Matrix(_) => true,
++                    SpecifiedOperation::PrefixedMatrix(Matrix { e: ref e, f: ref f, .. }) => {
++                        check_lo_po_number(e) &&
++                        check_lo_po_number(f)
++                    },
++                    SpecifiedOperation::Matrix3D { .. } => true,
++                    SpecifiedOperation::PrefixedMatrix3D {
++                        m41: ref m41,
++                        m42: ref m42,
++                        m43: ref m43,
++                        ..
++                    } => {
++                        check_lo_po_number(m41) &&
++                        check_lo_po_number(m42) &&
++                        (match *m43 {
++                            First(ref length) => check_length(length),
++                            Second(_) => true,
++                        })
++                    },
++                    SpecifiedOperation::Skew(_, _) => true,
++                    SpecifiedOperation::SkewX(_) => true,
++                    SpecifiedOperation::SkewY(_) => true,
++                    SpecifiedOperation::Translate(ref tx, ref ty) => {
++                        check_length_or_percentage(tx) &&
++                        (match ty {
++                            &Some(ref ty) => check_length_or_percentage(ty),
++                            &None => true,
++                        })
++                    },
++                    SpecifiedOperation::TranslateX(ref tx) => check_length_or_percentage(tx),
++                    SpecifiedOperation::TranslateY(ref ty) => check_length_or_percentage(ty),
++                    SpecifiedOperation::TranslateZ(ref length) => check_length(length),
++                    SpecifiedOperation::Translate3D(ref tx, ref ty, ref tz) => {
++                        check_length_or_percentage(tx) &&
++                        check_length_or_percentage(ty) &&
++                        check_length(tz)
++                    },
++                    SpecifiedOperation::Scale(_, _) => true,
++                    SpecifiedOperation::ScaleX(_) => true,
++                    SpecifiedOperation::ScaleY(_) => true,
++                    SpecifiedOperation::ScaleZ(_) => true,
++                    SpecifiedOperation::Scale3D(_, _, _) => true,
++                    SpecifiedOperation::Rotate(_) => true,
++                    SpecifiedOperation::RotateX(_) => true,
++                    SpecifiedOperation::RotateY(_) => true,
++                    SpecifiedOperation::RotateZ(_) => true,
++                    SpecifiedOperation::Rotate3D(_, _, _, _) => true,
++                    SpecifiedOperation::Perspective(ref length) => check_length(length),
++                    SpecifiedOperation::InterpolateMatrix {
++                        from_list: ref from_list,
++                        to_list: ref to_list,
++                        ..
++                    } => {
++                        check_transform_list(from_list) &&
++                        check_transform_list(to_list)
++                    },
++                    SpecifiedOperation::AccumulateMatrix {
++                        from_list: ref from_list,
++                        to_list: ref to_list,
++                        ..
++                    } => {
++                        check_transform_list(from_list) &&
++                        check_transform_list(to_list)
++                    },
++                }
++            })
++        }
++
++        use self::SpecifiedValueItem::*;
++
++        match *self {
++            Length(ref length) => check_length(length),
++            Number(_) => true,
++            Percentage(_) => true,
++            LengthPercentage(ref length_or_percentage) => check_length_or_percentage(length_or_percentage),
++            Color(_) => true,
++            Image(_) => true,
++            Url(_) => true,
++            Integer(_) => true,
++            Angle(_) => true,
++            Time(_) => true,
++            TransformList(ref transform_list) => check_transform_list(transform_list),
++            CustomIdent(_) => true,
++            SpecificIdent(_) => true,
++            TokenStream(_) => true,
++        }
++    }
++
++    pub fn to_computed_value(&self, context: &computed::Context) -> Result<ComputedValueItem, ()> {
++        macro_rules! compute {
++            ($_self:expr, $context:expr,
++
++             $($typ:ident),*) => {
++                match $_self {
++                    $(
++                        SpecifiedValueItem::$typ(ref value) => {
++                            Ok(ComputedValueItem::$typ(value.to_computed_value($context)))
++                        }
++                    ),*
++
++                    // Special cases.
++                    // Would put in the match syntax, but we can't have things
++                    // expand to match cases.
++
++                    SpecifiedValueItem::Url(ref url) => {
++                        ComputedUrl::from_specified(url).map(|x| ComputedValueItem::Url(x))
++                    },
++                    SpecifiedValueItem::CustomIdent(ref ident) => {
++                        Ok(ComputedValueItem::CustomIdent(ident.clone()))
++                    },
++                    SpecifiedValueItem::SpecificIdent(ref ident) => {
++                        Ok(ComputedValueItem::SpecificIdent(ident.clone()))
++                    },
++                    SpecifiedValueItem::TokenStream(ref stream) => {
++                        Ok(ComputedValueItem::TokenStream(stream.clone()))
++                    },
++                }
++            };
++        }
++
++        compute! {
++            *self, context,
++
++            Length, Number, Percentage, LengthPercentage, Color, Image, Integer,
++            Angle, Time, TransformList
++        }
++    }
++}
++
++//#[derive(ToComputedValue)]
++//looks like this is for computing sub-elements
++#[derive(Clone, HeapSizeOf, ToCss)]
++pub enum SpecifiedValue {
++    Item(SpecifiedValueItem),
++    // Note: can't have lists of <transform-list>s!
++    List(Vec<SpecifiedValueItem>),
++}
++
++impl SpecifiedValue {
++    pub fn is_computationally_independent(&self) -> bool {
++        match *self {
++            SpecifiedValue::Item(ref item) => item.is_computationally_independent(),
++            SpecifiedValue::List(ref items) => items.iter().all(|x| x.is_computationally_independent()),
++        }
++    }
++
++    pub fn to_computed_value(&self, context: &computed::Context) -> Result<ComputedValue, ()> {
++        match *self {
++            SpecifiedValue::Item(ref item) => {
++                item.to_computed_value(context).map(|x| ComputedValue::Item(x))
++            }
++            SpecifiedValue::List(ref items) => {
++                // All of the items must compute successfully.
++                items.iter()
++                    .map(|x| x.to_computed_value(context))
++                    .fold(Ok(Vec::new()), |list: Result<Vec<ComputedValueItem>, ()>, x| {
++                        list.and_then(|mut list| {
++                            x.and_then(move |x| {
++                                list.push(x);
++                                Ok(list)
++                            })
++                        })
++                    })
++                    .map(|list| ComputedValue::List(list))
++            },
++        }
++    }
++}
++
++#[derive(Clone, Debug, HeapSizeOf, ToCss)]
++pub enum ComputedValueItem {
++    Length(computed::Length),
++    Number(computed::Number),
++    Percentage(computed::Percentage),
++    LengthPercentage(computed::LengthOrPercentage),
++    Color(computed::Color),
++    Image(computed::Image),
++    // XXX apparently we store them all as this?
++    Url(ComputedUrl),
++    Integer(computed::Integer),
++    Angle(computed::Angle),
++    Time(computed::Time),
++    //Resolution(specified::Resolution),
++    TransformList(transform::computed_value::T),
++    CustomIdent(Ident),
++    SpecificIdent(Ident),
++    TokenStream(custom_properties::SpecifiedValue),
++}
++
++#[derive(Clone, Debug, HeapSizeOf, ToCss)]
++pub enum ComputedValue {
++    Item(ComputedValueItem),
++    List(Vec<ComputedValueItem>),
++}
++
++impl OneOrMoreSeparated for ComputedValueItem {
++    type S = Space;
++}
++
++impl Into<custom_properties::ComputedValue> for ComputedValue {
++    fn into(self) -> custom_properties::ComputedValue {
++        let mut css = String::new();
++        self.to_css::<String>(&mut css).unwrap();
++        let (first, last) = {
++            let mut missing_closing_characters = String::new();
++            let mut input = ParserInput::new(&css);
++            let mut input = Parser::new(&mut input);
++            // XXX agh! why do we need to parse again just to get
++            // these guys.
++            custom_properties::parse_declaration_value_block(
++                &mut input,
++                &mut None,
++                &mut missing_closing_characters
++            ).unwrap()
++        };
++        custom_properties::ComputedValue {
++            css: css,
++            first_token_type: first,
++            last_token_type: last,
++        }
++    }
++}
+diff -r 5805d929bec9 components/style/style_resolver.rs
+--- a/components/style/style_resolver.rs	Thu Jul 27 11:07:29 2017 -0500
++++ b/components/style/style_resolver.rs	Thu Jul 27 13:21:13 2017 -0700
+@@ -14,16 +14,17 @@ use matching::{CascadeVisitedMode, Match
+ use properties::{AnimationRules, CascadeFlags, ComputedValues};
+ use properties::{IS_LINK, IS_ROOT_ELEMENT, IS_VISITED_LINK};
+ use properties::{PROHIBIT_DISPLAY_CONTENTS, SKIP_ROOT_AND_ITEM_BASED_DISPLAY_FIXUP};
+ use properties::{VISITED_DEPENDENT_ONLY, cascade};
+ use rule_tree::StrongRuleNode;
+ use selector_parser::{PseudoElement, SelectorImpl};
+ use selectors::matching::{ElementSelectorFlags, MatchingContext, MatchingMode, VisitedHandlingMode};
+ use servo_arc::Arc;
++use std::borrow::Borrow;
+ use stylist::RuleInclusion;
+ 
+ /// A struct that takes care of resolving the style of a given element.
+ pub struct StyleResolverForElement<'a, 'ctx, 'le, E>
+ where
+     'ctx: 'a,
+     'le: 'ctx,
+     E: TElement + MatchMethods + 'le,
+@@ -480,16 +481,17 @@ where
+                 &self.context.shared.guards,
+                 parent_style,
+                 parent_style,
+                 layout_parent_style,
+                 style_if_visited,
+                 Some(&mut cascade_info),
+                 &self.context.thread_local.font_metrics_provider,
+                 cascade_flags,
+-                self.context.shared.quirks_mode
++                self.context.shared.quirks_mode,
++                self.context.shared.stylist.registered_property_set().borrow(),
+             );
+ 
+         cascade_info.finish(&self.element.as_node());
+ 
+         values
+     }
+ }
+diff -r 5805d929bec9 components/style/stylist.rs
+--- a/components/style/stylist.rs	Thu Jul 27 11:07:29 2017 -0500
++++ b/components/style/stylist.rs	Thu Jul 27 13:21:13 2017 -0700
+@@ -11,34 +11,37 @@ use context::{CascadeInputs, QuirksMode}
+ use dom::TElement;
+ use element_state::ElementState;
+ use font_metrics::FontMetricsProvider;
+ #[cfg(feature = "gecko")]
+ use gecko_bindings::structs::{nsIAtom, StyleRuleInclusion};
+ use invalidation::element::invalidation_map::InvalidationMap;
+ use invalidation::media_queries::{EffectiveMediaQueryResults, ToMediaListKey};
+ use media_queries::Device;
++use parking_lot::RwLock;
+ use properties::{self, CascadeFlags, ComputedValues};
+ use properties::{AnimationRules, PropertyDeclarationBlock};
+ #[cfg(feature = "servo")]
+ use properties::INHERIT_ALL;
++use properties_and_values::RegisteredPropertySet;
+ use rule_tree::{CascadeLevel, RuleTree, StyleSource};
+ use selector_map::{SelectorMap, SelectorMapEntry};
+ use selector_parser::{SelectorImpl, PseudoElement};
+ use selectors::attr::NamespaceConstraint;
+ use selectors::bloom::BloomFilter;
+ use selectors::matching::{ElementSelectorFlags, matches_selector, MatchingContext, MatchingMode};
+ use selectors::matching::VisitedHandlingMode;
+ use selectors::parser::{AncestorHashes, Combinator, Component, Selector};
+ use selectors::parser::{SelectorIter, SelectorMethods};
+ use selectors::sink::Push;
+ use selectors::visitor::SelectorVisitor;
+ use servo_arc::{Arc, ArcBorrow};
+ use shared_lock::{Locked, SharedRwLockReadGuard, StylesheetGuards};
+ use smallvec::VecLike;
++use std::borrow::Borrow;
+ use std::fmt::Debug;
+ #[cfg(feature = "servo")]
+ use std::marker::PhantomData;
+ use style_traits::viewport::ViewportConstraints;
+ #[cfg(feature = "gecko")]
+ use stylesheets::{CounterStyleRule, FontFaceRule};
+ use stylesheets::{CssRule, StyleRule};
+ use stylesheets::{StylesheetInDocument, Origin, UserAgentStylesheets};
+@@ -157,16 +160,23 @@ pub struct Stylist {
+     /// The total number of selectors.
+     num_selectors: usize,
+ 
+     /// The total number of declarations.
+     num_declarations: usize,
+ 
+     /// The total number of times the stylist has been rebuilt.
+     num_rebuilds: usize,
++
++    /// The set of registered custom properties associated with the document.
++    /// Should be initialized as soon as possible.
++    #[cfg_attr(feature = "servo", ignore_heap_size_of = "Arc")]
++    registered_property_set: Option<Arc<RwLock<RegisteredPropertySet>>>,
++
++    last_used_registered_property_set_generation: Option<u32>,
+ }
+ 
+ /// This struct holds data which user of Stylist may want to extract
+ /// from stylesheets which can be done at the same time as updating.
+ #[cfg(feature = "gecko")]
+ pub struct ExtraStyleData<'a> {
+     /// A list of effective font-face rules and their origin.
+     pub font_faces: &'a mut Vec<(Arc<Locked<FontFaceRule>>, Origin)>,
+@@ -251,16 +261,19 @@ impl Stylist {
+             attribute_dependencies: BloomFilter::new(),
+             style_attribute_dependency: false,
+             state_dependencies: ElementState::empty(),
+             mapped_ids: BloomFilter::new(),
+             selectors_for_cache_revalidation: SelectorMap::new(),
+             num_selectors: 0,
+             num_declarations: 0,
+             num_rebuilds: 0,
++
++            registered_property_set: None,
++            last_used_registered_property_set_generation: None,
+         };
+ 
+         SelectorImpl::each_eagerly_cascaded_pseudo_element(|pseudo| {
+             stylist.pseudos_map.insert(pseudo, PerPseudoElementSelectorMap::new());
+         });
+ 
+         // FIXME: Add iso-8859-9.css when the document’s encoding is ISO-8859-8.
+ 
+@@ -294,16 +307,18 @@ impl Stylist {
+ 
+     /// Clear the stylist's state, effectively resetting it to more or less
+     /// the state Stylist::new creates.
+     ///
+     /// We preserve the state of the following members:
+     ///   device: Someone might have set this on us.
+     ///   quirks_mode: Again, someone might have set this on us.
+     ///   num_rebuilds: clear() followed by rebuild() should just increment this
++    ///   registered_property_set: Should be set on us by the sole associated
++    ///                            document.
+     ///
+     /// We don't just use struct update syntax with Stylist::new(self.device)
+     /// beause for some of our members we can clear them instead of creating new
+     /// objects.  This does cause unfortunate code duplication with
+     /// Stylist::new.
+     pub fn clear(&mut self) {
+         if self.is_cleared {
+             return
+@@ -327,45 +342,88 @@ impl Stylist {
+         self.style_attribute_dependency = false;
+         self.state_dependencies = ElementState::empty();
+         self.mapped_ids.clear();
+         self.selectors_for_cache_revalidation = SelectorMap::new();
+         self.num_selectors = 0;
+         self.num_declarations = 0;
+         // preserve num_rebuilds value, since it should stay across
+         // clear()/rebuild() cycles.
++        self.last_used_registered_property_set_generation = None;
++    }
++
++    /// Set the registered property set associated with the document this
++    /// Stylist is styling.
++    pub fn set_registered_property_set(
++        &mut self,
++        registered_property_set: Arc<RwLock<RegisteredPropertySet>>
++    ) {
++        debug_assert!(if let Some(ref old) = self.registered_property_set {
++            Arc::ptr_eq(old, &registered_property_set)
++        } else { true });
++        self.registered_property_set = Some(registered_property_set);
++    }
++
++    /// Get the registered property set associated with the document this
++    /// Stylist is styling. Panics if there is none set.
++    pub fn registered_property_set(&self) -> Arc<RwLock<RegisteredPropertySet>> {
++        self.registered_property_set
++            .as_ref()
++            .expect("set_registered_property_set should have been called.")
++            .clone()
++    }
++
++    fn registered_property_set_updated(&self) -> Option<u32> {
++        let registered_property_set = self.registered_property_set.as_ref().unwrap();
++        let registered_property_set = registered_property_set.read();
++        if self.last_used_registered_property_set_generation !=
++           Some(registered_property_set.generation()) {
++            Some(registered_property_set.generation())
++        } else {
++            None
++        }
+     }
+ 
+     /// rebuild the stylist for the given document stylesheets, and optionally
+     /// with a set of user agent stylesheets.
+     ///
+     /// This method resets all the style data each time the stylesheets change
+     /// (which is indicated by the `stylesheets_changed` parameter), or the
+     /// device is dirty, which means we need to re-evaluate media queries.
++    ///
++    /// The registered property set must have been previously set.
+     pub fn rebuild<'a, 'b, I, S>(
+         &mut self,
+         doc_stylesheets: I,
+         guards: &StylesheetGuards,
+         ua_stylesheets: Option<&UserAgentStylesheets>,
+         stylesheets_changed: bool,
+         author_style_disabled: bool,
+         extra_data: &mut ExtraStyleData<'a>
+     ) -> bool
+     where
+         I: Iterator<Item = &'b S> + Clone,
+         S: StylesheetInDocument + ToMediaListKey + 'static,
+     {
+         debug_assert!(!self.is_cleared || self.is_device_dirty);
++        debug_assert!(self.registered_property_set.is_some(),
++                      "set_registered_property_set should have been called.");
+ 
+         self.is_cleared = false;
+ 
+-        if !(self.is_device_dirty || stylesheets_changed) {
++        let new_registered_property_set_generation = self.registered_property_set_updated();
++        if !(self.is_device_dirty || stylesheets_changed ||
++             new_registered_property_set_generation.is_some()) {
++            println!("rebuild: Quitting early. Nothing changed.");
+             return false;
+         }
+ 
++        self.last_used_registered_property_set_generation =
++            new_registered_property_set_generation;
++
+         self.num_rebuilds += 1;
+ 
+         self.viewport_constraints = None;
+ 
+         if viewport_rule::enabled() {
+             // TODO(emilio): This doesn't look so efficient.
+             //
+             // Presumably when we properly implement this we can at least have a
+@@ -421,21 +479,24 @@ impl Stylist {
+         SelectorImpl::each_precomputed_pseudo_element(|pseudo| {
+             if let Some(map) = self.pseudos_map.remove(&pseudo) {
+                 let declarations = map.user_agent.get_universal_rules(CascadeLevel::UANormal);
+                 self.precomputed_pseudo_element_decls.insert(pseudo, declarations);
+             }
+         });
+ 
+         self.is_device_dirty = false;
++
+         true
+     }
+ 
+     /// clear the stylist and then rebuild it.  Chances are, you want to use
+     /// either clear() or rebuild(), with the latter done lazily, instead.
++    ///
++    /// The registered property set must have been previously set.
+     pub fn update<'a, 'b, I, S>(
+         &mut self,
+         doc_stylesheets: I,
+         guards: &StylesheetGuards,
+         ua_stylesheets: Option<&UserAgentStylesheets>,
+         stylesheets_changed: bool,
+         author_style_disabled: bool,
+         extra_data: &mut ExtraStyleData<'a>
+@@ -443,17 +504,19 @@ impl Stylist {
+     where
+         I: Iterator<Item = &'b S> + Clone,
+         S: StylesheetInDocument + ToMediaListKey + 'static,
+     {
+         debug_assert!(!self.is_cleared || self.is_device_dirty);
+ 
+         // We have to do a dirtiness check before clearing, because if
+         // we're not actually dirty we need to no-op here.
+-        if !(self.is_device_dirty || stylesheets_changed) {
++        if !(self.is_device_dirty || stylesheets_changed ||
++             self.registered_property_set_updated().is_some()) {
++            //println!("update: Quitting early. Nothing changed.");
+             return false;
+         }
+         self.clear();
+         self.rebuild(doc_stylesheets, guards, ua_stylesheets, stylesheets_changed,
+                      author_style_disabled, extra_data)
+     }
+ 
+     fn add_stylesheet<'a, S>(
+@@ -637,17 +700,21 @@ impl Stylist {
+                             guards,
+                             parent,
+                             parent,
+                             parent,
+                             None,
+                             None,
+                             font_metrics,
+                             cascade_flags,
+-                            self.quirks_mode)
++                            self.quirks_mode,
++                            self.registered_property_set
++                                .as_ref()
++                                .expect("set_registered_property_set should have been called")
++                                .borrow())
+     }
+ 
+     /// Returns the style for an anonymous box of the given type.
+     #[cfg(feature = "servo")]
+     pub fn style_for_anonymous(&self,
+                                guards: &StylesheetGuards,
+                                pseudo: &PseudoElement,
+                                parent_style: &ComputedValues)
+@@ -754,17 +821,22 @@ impl Stylist {
+                                     guards,
+                                     Some(inherited_style),
+                                     Some(inherited_style),
+                                     Some(inherited_style),
+                                     None,
+                                     None,
+                                     font_metrics,
+                                     CascadeFlags::empty(),
+-                                    self.quirks_mode);
++                                    self.quirks_mode,
++                                    self.registered_property_set
++                                        .as_ref()
++                                        .expect("set_registered_property_set \
++                                                 should have been called.")
++                                        .borrow());
+ 
+             Some(computed)
+         } else {
+             None
+         };
+ 
+         // We may not have non-visited rules, if we only had visited ones.  In
+         // that case we want to use the root rulenode for our non-visited rules.
+@@ -780,17 +852,22 @@ impl Stylist {
+                                  guards,
+                                  Some(parent_style),
+                                  Some(parent_style),
+                                  Some(parent_style),
+                                  visited_values,
+                                  None,
+                                  font_metrics,
+                                  CascadeFlags::empty(),
+-                                 self.quirks_mode))
++                                 self.quirks_mode,
++                                 self.registered_property_set
++                                     .as_ref()
++                                     .expect("set_registered_property_set \
++                                              should have been called.")
++                                     .borrow()))
+     }
+ 
+     /// Computes the cascade inputs for a lazily-cascaded pseudo-element.
+     ///
+     /// See the documentation on lazy pseudo-elements in
+     /// docs/components/style.md
+     pub fn lazy_pseudo_rules<E>(&self,
+                                 guards: &StylesheetGuards,
+@@ -1345,17 +1422,22 @@ impl Stylist {
+                             guards,
+                             Some(parent_style),
+                             Some(parent_style),
+                             Some(parent_style),
+                             None,
+                             None,
+                             &metrics,
+                             CascadeFlags::empty(),
+-                            self.quirks_mode)
++                            self.quirks_mode,
++                            self.registered_property_set
++                                .as_ref()
++                                .expect("set_registered_property_set should \
++                                         have been called.")
++                                .borrow())
+     }
+ 
+     /// Accessor for a shared reference to the device.
+     pub fn device(&self) -> &Device {
+         &self.device
+     }
+ 
+     /// Accessor for a mutable reference to the device.
+diff -r 5805d929bec9 components/style_traits/Cargo.toml
+--- a/components/style_traits/Cargo.toml	Thu Jul 27 11:07:29 2017 -0500
++++ b/components/style_traits/Cargo.toml	Thu Jul 27 13:21:13 2017 -0700
+@@ -17,8 +17,9 @@ gecko = []
+ app_units = "0.5"
+ bitflags = "0.7"
+ cssparser = "0.18"
+ euclid = "0.15"
+ heapsize = {version = "0.4", optional = true}
+ heapsize_derive = {version = "0.1", optional = true}
+ selectors = { path = "../selectors" }
+ serde = {version = "1.0", optional = true}
++servo_atoms = { path = "../atoms" }
+diff -r 5805d929bec9 components/style_traits/lib.rs
+--- a/components/style_traits/lib.rs	Thu Jul 27 11:07:29 2017 -0500
++++ b/components/style_traits/lib.rs	Thu Jul 27 13:21:13 2017 -0700
+@@ -8,16 +8,17 @@
+ 
+ #![crate_name = "style_traits"]
+ #![crate_type = "rlib"]
+ 
+ #![deny(unsafe_code, missing_docs)]
+ 
+ #![cfg_attr(feature = "servo", feature(plugin))]
+ 
++extern crate servo_atoms;
+ extern crate app_units;
+ #[macro_use] extern crate bitflags;
+ #[macro_use] extern crate cssparser;
+ extern crate euclid;
+ #[cfg(feature = "servo")] extern crate heapsize;
+ #[cfg(feature = "servo")] #[macro_use] extern crate heapsize_derive;
+ extern crate selectors;
+ #[cfg(feature = "servo")] #[macro_use] extern crate serde;
+diff -r 5805d929bec9 components/style_traits/values.rs
+--- a/components/style_traits/values.rs	Thu Jul 27 11:07:29 2017 -0500
++++ b/components/style_traits/values.rs	Thu Jul 27 13:21:13 2017 -0700
+@@ -2,16 +2,17 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ //! Helper types and traits for the handling of CSS values.
+ 
+ use app_units::Au;
+ use cssparser::{BasicParseError, ParseError, Parser, Token, UnicodeRange, serialize_string};
+ use std::fmt::{self, Write};
++use servo_atoms::Atom;
+ 
+ /// Serialises a value according to its CSS representation.
+ ///
+ /// This trait is implemented for `str` and its friends, serialising the string
+ /// contents as a CSS quoted string.
+ ///
+ /// This trait is derivable with `#[derive(ToCss)]`, with the following behaviour:
+ /// * unit variants get serialised as the `snake-case` representation
+@@ -176,16 +177,23 @@ where
+     fn write_char(&mut self, c: char) -> fmt::Result {
+         if let Some(prefix) = self.prefix.take() {
+             self.writer.write_str(prefix)?;
+         }
+         self.writer.write_char(c)
+     }
+ }
+ 
++impl ToCss for Atom {
++    #[inline]
++    fn to_css<W>(&self, dest: &mut W) -> fmt::Result where W: fmt::Write {
++        (**self).to_css(dest)
++    }
++}
++
+ /// Type used as the associated type in the `OneOrMoreSeparated` trait on a
+ /// type to indicate that a serialized list of elements of this type is
+ /// separated by commas.
+ pub struct Comma;
+ 
+ /// Type used as the associated type in the `OneOrMoreSeparated` trait on a
+ /// type to indicate that a serialized list of elements of this type is
+ /// separated by spaces.
+diff -r 5805d929bec9 resources/prefs.json
+--- a/resources/prefs.json	Thu Jul 27 11:07:29 2017 -0500
++++ b/resources/prefs.json	Thu Jul 27 13:21:13 2017 -0700
+@@ -53,16 +53,17 @@
+   "js.throw_on_asmjs_validation_failure.enabled": false,
+   "js.throw_on_debuggee_would_run.enabled": false,
+   "js.werror.enabled": false,
+   "layout.animations.test.enabled": false,
+   "layout.column-count.enabled": false,
+   "layout.column-gap.enabled": false,
+   "layout.column-width.enabled": false,
+   "layout.columns.enabled": false,
++  "layout.css.properties-and-values.enabled": false,
+   "layout.text-orientation.enabled": false,
+   "layout.viewport.enabled": false,
+   "layout.writing-mode.enabled": false,
+   "network.mime.sniff": false,
+   "session-history.max-length": 20,
+   "shell.builtin-key-shortcuts.enabled": true,
+   "shell.homepage": "https://servo.org",
+   "shell.keep_screen_on.enabled": false,
+diff -r 5805d929bec9 tests/wpt/metadata/MANIFEST.json
+--- a/tests/wpt/metadata/MANIFEST.json	Thu Jul 27 11:07:29 2017 -0500
++++ b/tests/wpt/metadata/MANIFEST.json	Thu Jul 27 13:21:13 2017 -0700
+@@ -229657,16 +229657,21 @@
+      {}
+     ]
+    ],
+    "css/css-page-3/support/test-tr.png": [
+     [
+      {}
+     ]
+    ],
++   "css/css-properties-values-api-1/common.js": [
++    [
++     {}
++    ]
++   ],
+    "css/css-pseudo-4/OWNERS": [
+     [
+      {}
+     ]
+    ],
+    "css/css-pseudo-4/first-letter-001-ref.html": [
+     [
+      {}
+@@ -319320,16 +319325,64 @@
+     ]
+    ],
+    "css/css-logical-properties-1/logicalprops-quirklength.html": [
+     [
+      "/css/css-logical-properties-1/logicalprops-quirklength.html",
+      {}
+     ]
+    ],
++   "css/css-properties-values-api-1/animation.html": [
++    [
++     "/css/css-properties-values-api-1/animation.html",
++     {}
++    ]
++   ],
++   "css/css-properties-values-api-1/computed-values.html": [
++    [
++     "/css/css-properties-values-api-1/computed-values.html",
++     {}
++    ]
++   ],
++   "css/css-properties-values-api-1/cycles.html": [
++    [
++     "/css/css-properties-values-api-1/cycles.html",
++     {}
++    ]
++   ],
++   "css/css-properties-values-api-1/family.html": [
++    [
++     "/css/css-properties-values-api-1/family.html",
++     {}
++    ]
++   ],
++   "css/css-properties-values-api-1/independence.html": [
++    [
++     "/css/css-properties-values-api-1/independence.html",
++     {}
++    ]
++   ],
++   "css/css-properties-values-api-1/naming.html": [
++    [
++     "/css/css-properties-values-api-1/naming.html",
++     {}
++    ]
++   ],
++   "css/css-properties-values-api-1/registration.html": [
++    [
++     "/css/css-properties-values-api-1/registration.html",
++     {}
++    ]
++   ],
++   "css/css-properties-values-api-1/syntax.html": [
++    [
++     "/css/css-properties-values-api-1/syntax.html",
++     {}
++    ]
++   ],
+    "css/css-regions-1/cssomview-apis-no-region-chain-001.html": [
+     [
+      "/css/css-regions-1/cssomview-apis-no-region-chain-001.html",
+      {}
+     ]
+    ],
+    "css/css-regions-1/flow-into-parsing-001.html": [
+     [
+@@ -496329,16 +496382,52 @@
+   "css/css-page-3/support/test-tl.png": [
+    "956e5156fd8c0e75b1c0f3b8b3b900b653663f74",
+    "support"
+   ],
+   "css/css-page-3/support/test-tr.png": [
+    "078e1dd6dd61d36cec239ed75d02051f61fe60a5",
+    "support"
+   ],
++  "css/css-properties-values-api-1/animation.html": [
++   "95263fbc55d549f3b3af05885164b0032f6b27bc",
++   "testharness"
++  ],
++  "css/css-properties-values-api-1/common.js": [
++   "f6672192be65b3af4292122142da45344f71f999",
++   "support"
++  ],
++  "css/css-properties-values-api-1/computed-values.html": [
++   "a1eebb401a7b39a0f2a9f57ca4d60fbf1416b58d",
++   "testharness"
++  ],
++  "css/css-properties-values-api-1/cycles.html": [
++   "d5e1649c88102f27da5fe1ac16715cfee7f70f84",
++   "testharness"
++  ],
++  "css/css-properties-values-api-1/family.html": [
++   "ddc7dd91a411ee2105b751afb80381569cf38dd2",
++   "testharness"
++  ],
++  "css/css-properties-values-api-1/independence.html": [
++   "4de3906f7bb9a8c7cc3d4252ab2c454a23105606",
++   "testharness"
++  ],
++  "css/css-properties-values-api-1/naming.html": [
++   "d8222bc3ef131da9f19e18194b45d0b032e5ab0e",
++   "testharness"
++  ],
++  "css/css-properties-values-api-1/registration.html": [
++   "a8773b9a6cb802bf3c47339cde4a2553a5e8209e",
++   "testharness"
++  ],
++  "css/css-properties-values-api-1/syntax.html": [
++   "a26d49e9885c243c9567d47b2ad4c1546dbadbc4",
++   "testharness"
++  ],
+   "css/css-pseudo-4/OWNERS": [
+    "e196548942a4d77448f734235b3456e2a830a5a7",
+    "support"
+   ],
+   "css/css-pseudo-4/first-letter-001-ref.html": [
+    "f53ee70c3b61a9f812a9a44afb1364040563f473",
+    "support"
+   ],
+diff -r 5805d929bec9 tests/wpt/metadata/css/css-properties-values-api-1/__dir__.ini
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/tests/wpt/metadata/css/css-properties-values-api-1/__dir__.ini	Thu Jul 27 13:21:13 2017 -0700
+@@ -0,0 +1,1 @@
++prefs: [layout.css.properties-and-values.enabled:true]
+diff -r 5805d929bec9 tests/wpt/metadata/css/css-properties-values-api-1/animation.html.ini
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/tests/wpt/metadata/css/css-properties-values-api-1/animation.html.ini	Thu Jul 27 13:21:13 2017 -0700
+@@ -0,0 +1,59 @@
++[animation.html]
++  type: testharness
++  [anim: {"keyframes":"number","property":"--number","syntax":"<number>","halfway":"0.5"}]
++    expected: FAIL
++
++  [anim: {"keyframes":"transform","property":"--transform","syntax":"<transform-function>","halfway":"rotate(90deg)"}]
++    expected: FAIL
++
++  [anim: {"keyframes":"list1","property":"--list","syntax":"<number>+","halfway":"0.5 1.0"}]
++    expected: FAIL
++
++  [anim: {"keyframes":"lp","property":"--lp","syntax":"<length-percentage>","halfway":"calc(7 + 30%)"}]
++    expected: FAIL
++
++  [anim: {"keyframes":"length","property":"--length","syntax":"<length>","halfway":"5px"}]
++    expected: FAIL
++
++  [anim: {"keyframes":"percentage","property":"--percentage","syntax":"<percentage>","halfway":"50%"}]
++    expected: FAIL
++
++  [anim: {"keyframes":"integer","property":"--integer","syntax":"<integer>","halfway":"5"}]
++    expected: FAIL
++
++  [anim: {"keyframes":"lps1","property":"--lps","syntax":"<length-percentage>+","halfway":"50px 50% calc(50px + 50%)"}]
++    expected: FAIL
++
++  [anim: {"keyframes":"lps2","property":"--lps","syntax":"<length-percentage>+","halfway":"calc(75px + 0%) calc(0px + 75%) calc(25px + 25%)"}]
++    expected: FAIL
++
++  [anim #2: {"syntax":"<number>","keyframes":["0","1"\],"checks":{"0.4":"0.4","0.6":"0.6"}}]
++    expected: FAIL
++
++  [anim #2: {"syntax":"<angle>","keyframes":["0deg","90deg"\],"checks":{"0.4":"0deg","0.6":"90deg"}}]
++    expected: FAIL
++
++  [anim #2: {"syntax":"<time>","keyframes":["3s","9s"\],"checks":{"0.4":"3s","0.6":"9s"}}]
++    expected: FAIL
++
++  [anim #2: {"syntax":"<resolution>","keyframes":["96dpi","144dpi"\],"checks":{"0.4":"96dpi","0.6":"144dpi"}}]
++    expected: FAIL
++
++  [anim #2: {"syntax":"<custom-ident>","keyframes":["doing-good","is-in-our-code"\],"checks":{"0.4":"doing-good","0.6":"is-in-our-code"}}]
++    expected: FAIL
++
++  [anim #2: {"syntax":"Mozilla | Firefox","keyframes":["Mozilla","Firefox"\],"checks":{"0.4":"Mozilla","0.6":"Firefox"}}]
++    expected: FAIL
++
++  [anim #2: {"syntax":"<url>","keyframes":["url(\\"http://mozilla.com/\\")","url(\\"http://firefox.com/\\")"\],"checks":{"0.4":"url(\\"http://mozilla.com/\\")","0.6":"url(\\"http://firefox.com/\\")"}}]
++    expected: FAIL
++
++  [anim #2: {"syntax":"*","keyframes":["youve never seen the real numbers","like this before"\],"checks":{"0.4":"youve never seen the real numbers","0.6":"like this before"}}]
++    expected: FAIL
++
++  [Custom properties without initial values missing in keyframes should be removed.]
++    expected: FAIL
++
++  [Custom properties in missing keyframes using computed values should be filled in.]
++    expected: FAIL
++
+diff -r 5805d929bec9 tests/wpt/web-platform-tests/css/css-properties-values-api-1/animation.html
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/tests/wpt/web-platform-tests/css/css-properties-values-api-1/animation.html	Thu Jul 27 13:21:13 2017 -0700
+@@ -0,0 +1,355 @@
++<!doctype html>
++<meta charset=utf-8>
++<title>Bug 1273706 - Animation (CSS Properties &amp; Values API Level 1)</title>
++<link rel="help" href="https://drafts.css-houdini.org/css-properties-values-api/#animation-behavior-of-custom-properties" />
++<script src=/resources/testharness.js></script>
++<script src=/resources/testharnessreport.js></script>
++<script src="common.js"></script>
++
++<!-- Styles used to test custom properties going through the whole system
++     correctly. -->
++<style type="text/css">
++div#container {
++  font-size: 16px;
++}
++
++@keyframes number {
++  from { --number: 0; }
++  to { --number: 1; }
++}
++
++@keyframes transform {
++  from { --transform: rotate(0deg); }
++  to { --transform: rotate(180deg); }
++}
++
++@keyframes list1 {
++  from { --list: 0 0; }
++  to { --list: 1 2; }
++}
++
++@keyframes lp {
++  from { --lp: calc(0 + 15%); }
++  to { --lp: calc(45% + 14); }
++}
++
++@keyframes length {
++  from { --length: 0px; }
++  to { --length: 10px; }
++}
++
++@keyframes percentage {
++  from { --percentage: 0%; }
++  to { --percentage: 100%; }
++}
++
++@keyframes integer {
++  from { --integer: 0; }
++  to { --integer: 10; }
++}
++
++@keyframes lps1 {
++  from { --lps: 0px 0% calc(0px + 0%); }
++  to { --lps: 100px 100% calc(100px + 100%); }
++}
++
++@keyframes lps2 {
++  from { --lps: calc(50px + 0%) calc(0px + 50%) calc(50px + 50%); }
++  to { --lps: calc(100px + 0%) calc(0px + 100%) calc(0px + 0%); }
++}
++
++@keyframes missing {
++  from { --number: 0; }
++}
++</style>
++
++<!-- Some dummy elements that we will use for testing. -->
++<div id="container">
++  <div id="sandbox"></div>
++</div>
++
++<script>
++// Test specifications.
++let animTests = [
++  { keyframes: "number",
++    property: "--number",
++    syntax: "<number>",
++    halfway: "0.5"
++  },
++  { keyframes: "transform",
++    property: "--transform",
++    syntax: "<transform-function>",
++    halfway: "rotate(90deg)"
++  },
++  { keyframes: "list1",
++    property: "--list",
++    syntax: "<number>+",
++    halfway: "0.5 1.0"
++  },
++  { keyframes: "lp",
++    property: "--lp",
++    syntax: "<length-percentage>",
++    halfway: "calc(7 + 30%)"
++  },
++  { keyframes: "length",
++    property: "--length",
++    syntax: "<length>",
++    halfway: "5px",
++  },
++  { keyframes: "percentage",
++    property: "--percentage",
++    syntax: "<percentage>",
++    halfway: "50%",
++  },
++  { keyframes: "integer",
++    property: "--integer",
++    syntax: "<integer>",
++    halfway: "5",
++  },
++  { keyframes: "lps1",
++    property: "--lps",
++    syntax: "<length-percentage>+",
++    halfway: "50px 50% calc(50px + 50%)",
++  },
++  { keyframes: "lps2",
++    property: "--lps",
++    syntax: "<length-percentage>+",
++    halfway: "calc(75px + 0%) calc(0px + 75%) calc(25px + 25%)",
++  },
++];
++
++let animTests2 = [
++  { syntax: "<number>",
++    keyframes: [
++      "0",
++      "1",
++    ],
++    checks: {
++      "0.4": "0.4",
++      "0.6": "0.6",
++    },
++  },
++
++  // These are uninterpolable values.
++  // They should be flip at 50%.
++
++  { syntax: "<angle>",
++    keyframes: [
++      "0deg",
++      "90deg",
++    ],
++    checks: {
++      "0.4": "0deg",
++      "0.6": "90deg",
++    },
++  },
++
++  { syntax: "<time>",
++    keyframes: [
++      "3s",
++      "9s",
++    ],
++    checks: {
++      "0.4": "3s",
++      "0.6": "9s",
++    },
++  },
++
++  { syntax: "<resolution>",
++    keyframes: [
++      "96dpi",
++      "144dpi",
++    ],
++    checks: {
++      "0.4": "96dpi",
++      "0.6": "144dpi",
++    },
++  },
++
++  { syntax: "<custom-ident>",
++    keyframes: [
++      "doing-good",
++      "is-in-our-code",
++    ],
++    checks: {
++      "0.4": "doing-good",
++      "0.6": "is-in-our-code",
++    },
++  },
++
++  { syntax: "Mozilla | Firefox",
++    keyframes: [
++      "Mozilla",
++      "Firefox",
++    ],
++    checks: {
++      "0.4": "Mozilla",
++      "0.6": "Firefox",
++    },
++  },
++
++  // <url>s need to carry around a principal too, so it's worth testing that we
++  // are able to pass them around correctly (the others are all just unparsed
++  // strings).
++  { syntax: "<url>",
++    keyframes: [
++      "url(\"http://mozilla.com/\")",
++      "url(\"http://firefox.com/\")",
++    ],
++    checks: {
++      "0.4": "url(\"http://mozilla.com/\")",
++      "0.6": "url(\"http://firefox.com/\")",
++    },
++  },
++
++  { syntax: "*",
++    keyframes: [
++      "youve never seen the real numbers",
++      "like this before",
++    ],
++    checks: {
++      "0.4": "youve never seen the real numbers",
++      "0.6": "like this before",
++    },
++  },
++];
++
++let sandbox = document.getElementById("sandbox");
++
++for (let spec of animTests) {
++  let { keyframes, property, syntax, halfway } = spec;
++  test(function () {
++    try {
++      CSS.registerProperty({ name: property, syntax: syntax });
++
++      // Store into |computedExpected| the computed value we get from specifying
++      // |halfway|. This should normalize the value.
++      sandbox.style.setProperty(property, halfway);
++      let computedExpected = window.getComputedStyle(sandbox)
++                                   .getPropertyValue(property);
++      sandbox.style.removeProperty(property);
++
++      sandbox.style.setProperty("animation-name", keyframes);
++      sandbox.style.setProperty("animation-duration", "1s");
++      sandbox.style.setProperty("animation-timing-function", "linear");
++
++      let anim = sandbox.getAnimations()[0];
++      anim.pause();
++      anim.currentTime = 500;
++
++      let computed = window.getComputedStyle(sandbox)
++                           .getPropertyValue(property);
++      assert_equals(computed, computedExpected,
++                    "halfway value equals expected value");
++    } finally {
++      sandbox.style.removeProperty("animation-name");
++      sandbox.style.removeProperty("animation-duration");
++      sandbox.style.removeProperty("animation-timing-function");
++      CSS.unregisterProperty(property);
++    }
++  }, "anim: " + JSON.stringify(spec));
++}
++
++for (let spec of animTests2) {
++  let { keyframes, initial, syntax, checks } = spec;
++  test(function () {
++    try {
++      CSS.registerProperty({ name: "--test", syntax: syntax });
++
++      let anim = sandbox.animate(
++                   keyframes.map(value => ({ "--test": value })), 1000);
++      try {
++        anim.pause();
++        for (let point in checks) {
++          let time = parseFloat(point);
++          anim.currentTime = time * 1000;
++          let computed = window.getComputedStyle(sandbox)
++                               .getPropertyValue("--test");
++          assert_equals(computed, checks[point],
++                        `value at time ${time} equals expected value`);
++        }
++      } finally {
++        anim.cancel();
++      }
++    } finally {
++      sandbox.style.removeProperty("--test");
++      CSS.unregisterProperty("--test");
++    }
++  }, "anim #2: " + JSON.stringify(spec));
++}
++
++// Make sure that we fill in missing keyframe values.
++// It's possible to have custom properties without initial values (i.e. they
++// have invalid initial values).
++// CSS Animations says:
++//   If a ‘0%’ or ‘from’ keyframe is not specified, then the user agent
++//   constructs a ‘0%’ keyframe using the computed values of the properties
++//   being animated. If a ‘100%’ or ‘to’ keyframe is not specified, then the
++//   user agent constructs a ‘100%’ keyframe using the computed values of the
++//   properties being animated.
++// But for a custom property without an initial value, it's not possible to
++// fill in a value.
++
++test(function () {
++  CSS.registerProperty({ name: "--number", syntax: "<number>" });
++
++  sandbox.style.setProperty("animation-name", "missing");
++  sandbox.style.setProperty("animation-duration", "1s");
++  sandbox.style.setProperty("animation-timing-function", "linear");
++
++  let anim = sandbox.getAnimations()[0];
++  anim.pause();
++  anim.currentTime = 500;
++
++  try {
++    assert_equals(window.getComputedStyle(sandbox)
++                        .getPropertyValue("--number"),
++                  "",
++                  "There should be no animation if there is no property to " +
++                  "fall back on.");
++    // Shouldn't segfault while uncomputing values either!
++    for (let keyframe of anim.effect.getKeyframes()) {
++      assert_equals(keyframe["--number"], undefined,
++        "Shouldn't have --number in keyframes when we were missing a " +
++        "keyframe value.");
++    }
++  } finally {
++    CSS.unregisterProperty("--number");
++    sandbox.style.removeProperty("animation-name");
++    sandbox.style.removeProperty("animation-duration");
++    sandbox.style.removeProperty("animation-timing-function");
++  }
++}, "Custom properties without initial values missing in keyframes should be " +
++   "removed.");
++
++test(function () {
++  CSS.registerProperty({ name: "--number", syntax: "<number>" });
++
++  sandbox.style.setProperty("animation-name", "missing");
++  sandbox.style.setProperty("animation-duration", "1s");
++  sandbox.style.setProperty("animation-timing-function", "linear");
++  sandbox.style.setProperty("--number", "1");
++
++  let anim = sandbox.getAnimations()[0];
++  anim.pause();
++  anim.currentTime = 500;
++
++  try {
++    assert_equals(window.getComputedStyle(sandbox)
++                        .getPropertyValue("--number"),
++                  "0.5",
++                  "Animation value should have been filled in using computed " +
++                  "value.");
++    for (let keyframe of anim.effect.getKeyframes()) {
++      assert_true(keyframe["--number"] != undefined,
++        "Should have --number in keyframes, serialized as a custom property.");
++    }
++  } finally {
++    CSS.unregisterProperty("--number");
++    sandbox.style.removeProperty("animation-name");
++    sandbox.style.removeProperty("animation-duration");
++    sandbox.style.removeProperty("animation-timing-function");
++  }
++}, "Custom properties in missing keyframes using computed values should be " +
++   "filled in.");
++</script>
+diff -r 5805d929bec9 tests/wpt/web-platform-tests/css/css-properties-values-api-1/common.js
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/tests/wpt/web-platform-tests/css/css-properties-values-api-1/common.js	Thu Jul 27 13:21:13 2017 -0700
+@@ -0,0 +1,45 @@
++let expectFail = function (testName, specs, type, message) {
++  for (let spec of specs) {
++    test(function () {
++      if (!spec.name) {
++        spec.name = "--test-property";
++      }
++      let caught = null;
++      try {
++        CSS.registerProperty(spec);
++      } catch (e) {
++        caught = e;
++      }
++      let passed = caught instanceof DOMException && caught.name == type;
++      try {
++        assert_true(passed, message + " " + JSON.stringify(spec));
++      } finally {
++        if (!passed) {
++          CSS.unregisterProperty(spec.name);
++        }
++      }
++    }, testName + ": " + JSON.stringify(spec));
++  }
++};
++
++let expectSucceed = function (testName, specs, message) {
++  for (let spec of specs) {
++    test(function () {
++      if (!spec.name) {
++        spec.name = "--test-property";
++      }
++      let caught = null;
++      try {
++        CSS.registerProperty(spec);
++      } catch (e) {
++        caught = e;
++      }
++      let passed = !caught;
++      assert_true(passed, message + " " + JSON.stringify(spec));
++      if (passed) {
++        CSS.unregisterProperty(spec.name);
++      }
++    }, testName + ": " + JSON.stringify(spec));
++  }
++};
++
+diff -r 5805d929bec9 tests/wpt/web-platform-tests/css/css-properties-values-api-1/computed-values.html
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/tests/wpt/web-platform-tests/css/css-properties-values-api-1/computed-values.html	Thu Jul 27 13:21:13 2017 -0700
+@@ -0,0 +1,335 @@
++<!doctype html>
++<meta charset=utf-8>
++<title>Bug 1273706 - Computed Values (CSS Properties &amp; Values API Level 1)</title>
++<link rel="help" href="https://drafts.css-houdini.org/css-properties-values-api/#calculation-of-computed-values" />
++<script src=/resources/testharness.js></script>
++<script src=/resources/testharnessreport.js></script>
++
++<style type="text/css">
++div#container {
++  font-size: 16px;
++}
++</style>
++
++<div id="container">
++  <div id="sandbox"></div>
++</div>
++<a id="link" href="/"></a>
++
++<script>
++let baseURL = document.getElementById("link").href;
++let sandbox = document.getElementById("sandbox");
++
++// https://drafts.csswg.org/cssom/#serialize-a-css-value
++
++let computedValueTests = [
++  // Parsing & computing (incl. serializing) lists of idents.
++  {
++    syntax: "a+ | <custom-ident>+",
++    declared: "a a a a b c d",
++    expected: "a a a a b c d",
++  },
++  // Angle units by themselves and in transform functions.
++  {
++    syntax: "<angle>",
++    declared: "0deg",
++    expected: "0deg",
++  },
++  {
++    syntax: "<angle>",
++    declared: "0grad",
++    expected: "0grad",
++  },
++  {
++    syntax: "<angle>",
++    declared: "0rad",
++    expected: "0rad",
++  },
++  {
++    syntax: "<angle>",
++    declared: "0turn",
++    expected: "0turn",
++  },
++  {
++    syntax: "<transform-list>",
++    declared: "rotate(0deg)",
++    expected: "rotate(0deg)",
++  },
++  {
++    syntax: "<transform-list>",
++    declared: "rotate(0grad)",
++    expected: "rotate(0grad)",
++  },
++  {
++    syntax: "<transform-list>",
++    declared: "rotate(0rad)",
++    expected: "rotate(0rad)",
++  },
++  {
++    syntax: "<transform-list>",
++    declared: "rotate(0turn)",
++    expected: "rotate(0turn)",
++  },
++  // Correctly serializing unitless 0 in '<length> | <percentage>'.
++  { syntax: "<length> | <percentage>",
++    declared: "0",
++    expected: "0px",
++  },
++
++  // Normalization of <length-percentage> values [1]
++  // [1]: https://drafts.css-houdini.org/css-properties-values-api/#calculation-of-computed-values
++
++  { syntax: "<length-percentage>",
++    declared: "calc(70% - 70% + 20px)",
++    expected: "calc(20px + 0%)",
++  },
++  {
++    syntax: "<length-percentage>",
++    declared: "calc(20px - 20px - 30%)",
++    expected: "calc(0px + -30%)",
++  },
++  // Should simplify calc(Xpx) to Xpx
++  { syntax: "<length-percentage>",
++    declared: "calc(20px - 17px)",
++    expected: "3px",
++  },
++  // Should simplify calc(X%) to X%
++  { syntax: "<length-percentage>",
++    declared: "calc(15% + 5%)",
++    expected: "20%",
++  },
++  { syntax: "<percentage> | <length>",
++    declared: "calc(15px)",
++    expected: "15px",
++  },
++  { syntax: "<length> | <percentage>",
++    declared: "calc(15%)",
++    expected: "15%",
++  },
++
++  // Test basic computation of each of the basic syntax strings.
++
++  { syntax: "<length>",
++    declared: "10px",
++    expected: "10px",
++  },
++
++  { syntax: "<number>",
++    declared: "3.1415",
++    expected: "3.1415",
++  },
++  { syntax: "<number>",
++    declared: "calc(1 * 2 + 3 / 4)",
++    expected: "2.75",
++  },
++  { syntax: "<number>",
++    declared: "calc(1 / 0)",
++    expected: "",
++  },
++
++  { syntax: "<percentage>",
++    declared: "2.7%",
++    expected: "2.7%",
++  },
++
++  { syntax: "<length-percentage>",
++    declared: "calc(13px + 27%)",
++    expected: "calc(13px + 27%)",
++  },
++
++  { syntax: "<color>",
++    declared: "#abcdef01",
++    expected: "rgb(171, 205, 239, 0.004)",
++  },
++  { syntax: "<color>",
++    declared: "red",
++    expected: "red",
++  },
++  { syntax: "<color>",
++    declared: "currentcolor",
++    expected: "currentcolor",
++  },
++
++  { syntax: "<image>",
++    declared: "url(\"http://example.com/some_image.jpg\")",
++    expected: "url(\"http://example.com/some_image.jpg\")",
++  },
++
++  { syntax: "<image>",
++    declared: "linear-gradient(45deg, white, black)",
++    expected: "linear-gradient(45deg, rgb(255, 255, 255), rgb(0, 0, 0))",
++  },
++
++  { syntax: "<image>",
++    testProperty: "background-image",
++    declared: "radial-gradient(2em at 60px 50% , #000000 0%, #000000 14px, rgba(0, 0, 0, 0.3) 18px, rgba(0, 0, 0, 0) 4em)",
++    expected: "radial-gradient(32px at 60px 50%, rgb(0, 0, 0) 0%, rgb(0, 0, 0) 14px, rgba(0, 0, 0, 0.3) 18px, transparent 64px)",
++    // This is the serialization result we get in Gecko from calling
++    // getComputedStyle and getPropertyValue on a background-image property set
++    // to this value.
++    // But because this doesn't seem to be fully specified, we set
++    // 'background-image' to 'expected' and compare with the computed style off
++    // of that. The browser should at the least be consistent.
++  },
++
++  { syntax: "<url>",
++    declared: "url(\"http://example.com/\")",
++    expected: "url(\"http://example.com/\")",
++  },
++
++  { syntax: "<url>",
++    declared: "url(\"/some_link\")",
++    expected: "url(\"" + baseURL + "some_link\")",
++  },
++
++  { syntax: "<integer>",
++    declared: "42",
++    expected: "42",
++  },
++  { syntax: "<integer>",
++    declared: "calc(1 + 2 * 3 / 6)",
++    // Any divisions in <integer> calc()s cause the whole thing to be invalid at parse time.
++    expected: "",
++  },
++  { syntax: "<integer>",
++    declared: "calc(1 + 2 * 3)",
++    expected: "7",
++  },
++  { syntax: "<integer>",
++    declared: "calc(1 + 2 + 3)",
++    expected: "6",
++  },
++  { syntax: "<integer>",
++    declared: "calc(1 * 2 * 3)",
++    expected: "6",
++  },
++  { syntax: "<integer>",
++    declared: "calc(0.5 * 2 * 3)",
++    expected: "",
++  },
++  // Additive coefficients should be resolved.
++  { syntax: "<integer>",
++    declared: "calc((1 + 2) * 3)",
++    expected: "9",
++  },
++  { syntax: "<integer>",
++    declared: "calc((1 * 2) * 3)",
++    expected: "6",
++  },
++  { syntax: "<integer>",
++    declared: "calc(1 * (2 * 3))",
++    expected: "6",
++  },
++  // This isn't unitless zero -- this is an integral zero!
++  { syntax: "<integer>",
++    declared: "calc(0)",
++    expected: "0",
++  },
++  { syntax: "<integer>",
++    declared: "calc(((0) * 3) + 7)",
++    expected: "7",
++  },
++
++  { syntax: "<angle>",
++    declared: "37deg",
++    expected: "37deg",
++  },
++
++  { syntax: "<time>",
++    declared: "5s",
++    expected: "5s",
++  },
++
++  { syntax: "<resolution>",
++    declared: "50dppx",
++    expected: "50dppx",
++  },
++
++  { syntax: "<transform-list>",
++    declared: "matrix(1, 0, 1, 0, 1, 1)",
++    expected: "matrix(1, 0, 1, 0, 1, 1)",
++  },
++
++  { syntax: "Mozilla | Firefox",
++    declared: "Mozilla",
++    expected: "Mozilla",
++  },
++
++  { syntax: "<custom-ident>",
++    declared: "Mozilla",
++    expected: "Mozilla",
++  },
++
++  { syntax: "*",
++    declared: " ",
++    expected: " ",
++  },
++
++  { syntax: "*",
++    declared: "i was the shadow of the waxwing slain",
++    expected: "i was the shadow of the waxwing slain",
++  },
++
++  // https://drafts.csswg.org/cssom/#dom-cssstyledeclaration-getpropertyvalue
++  // We should return the empty string when there is no declaration (in this
++  // case, beacuse couldn't compute.)
++
++  { syntax: "<length>",
++    declared: "calc(5px + 7%)",
++    expected: "",
++  },
++
++  { syntax: "<percentage>",
++    declared: "calc(7% + 5px)",
++    expected: "",
++  },
++
++  { syntax: "<length>",
++    declared: "Mozilla",
++    expected: "",
++  },
++
++  { syntax: "<length>+",
++    declared: "5px calc(5px + 7%) 1em",
++    // This should be invalid at parse time.
++    expected: "",
++  },
++];
++
++
++// This also tests setting styles with custom properties through the 'style'
++// attribute, which takes a different path to the parser (this isn't CSSOM!)
++
++for (let spec of computedValueTests) {
++  let { syntax, declared, expected } = spec;
++  var i = 0;
++  test(function () {
++    try {
++      CSS.registerProperty({ name: "--computed", syntax: syntax });
++      sandbox.setAttribute("style", `--computed:${declared};`);
++
++      let computedValue = window.getComputedStyle(sandbox)
++                                .getPropertyValue("--computed");
++
++      // If 'test-property' is supplied, compare with the serialization we get
++      // from setting the same value on test-property.
++      let expectedNormalized = expected;
++      if (spec.testProperty) {
++        sandbox.setAttribute("style", `${spec.testProperty}:${expected};`);
++        expectedNormalized = window.getComputedStyle(sandbox)
++                                   .getPropertyValue(spec.testProperty);
++      }
++
++      assert_equals(computedValue, expectedNormalized, 
++                    "computed value equals expected value");
++
++    } finally {
++      sandbox.removeAttribute("style");
++      try {
++        CSS.unregisterProperty("--computed");
++      } catch (e) { }
++    }
++  }, "computed value: " + JSON.stringify(spec));
++}
++
++</script>
+diff -r 5805d929bec9 tests/wpt/web-platform-tests/css/css-properties-values-api-1/cycles.html
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/tests/wpt/web-platform-tests/css/css-properties-values-api-1/cycles.html	Thu Jul 27 13:21:13 2017 -0700
+@@ -0,0 +1,49 @@
++<!doctype html>
++<meta charset=utf-8>
++<title>Bug 1273706 - Cycle Detection (CSS Properties &amp; Values API Level 1)</title>
++<link rel="help" href="https://drafts.css-houdini.org/css-properties-values-api/" />
++<script src=/resources/testharness.js></script>
++<script src=/resources/testharnessreport.js></script>
++
++<style>
++body {
++  font-size: 16px;
++}
++
++#div {
++  --font-size: 10em;
++  font-size: var(--font-size);
++}
++</style>
++
++<div id="test">
++</div>
++
++<script>
++test(function () {
++  // If the property is not registered, the computed value of --font-size is just
++  // a token stream, so there's no issue with there being a cycle.
++
++  CSS.registerProperty({
++    name: "--font-size",
++    syntax: "<length>",
++    inherits: false,
++    initialValue: "30px"
++  });
++
++  // Now there's a cyclic dependency between --font-size and font-size.
++  // We require the absolute length of an em in order to compute --font-size, but
++  // we require the computed value of --font-size in order to substitute it in the
++  // place of var(--font-size) in the declaration for font-size.
++  // We should resolve this the same way we resolve cycles between CSS variables:
++  // by treating everything involved to 'unset'.
++  //
++  // font-size is inherited, so its should end up as 16px (from body).
++  // --font-size is uninherited and has an initial value of 30px.
++
++  let el = document.getElementById("test");
++  assert_equals(window.getComputedStyle(el).getPropertyValue("--font-size"), "30px");
++  assert_equals(window.getComputedStyle(el).getPropertyValue("font-size"), "16px");
++}, "A cycle involving a variable using ems and the font-size property should " +
++   "result in everything ending up unset.");
++</script>
+diff -r 5805d929bec9 tests/wpt/web-platform-tests/css/css-properties-values-api-1/family.html
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/tests/wpt/web-platform-tests/css/css-properties-values-api-1/family.html	Thu Jul 27 13:21:13 2017 -0700
+@@ -0,0 +1,185 @@
++<!doctype html>
++<meta charset=utf-8>
++<title>Bug 1273706 - Inheritance &amp; Cacading (CSS Properties &amp; Values API Level 1)</title>
++<link rel="help" href="https://drafts.css-houdini.org/css-properties-values-api/" />
++<script src=/resources/testharness.js></script>
++<script src=/resources/testharnessreport.js></script>
++
++<style type="text/css">
++div#container {
++  font-size: 16px;
++}
++</style>
++
++<div id="container">
++  <div id="grandparent">
++    <div id="parent">
++      <div id="child"></div>
++    </div>
++  </div>
++</div>
++
++<script>
++let grandparent = document.getElementById("grandparent");
++let parent = document.getElementById("parent");
++let child = document.getElementById("child");
++
++// { registrations: [
++//     { name: <custom property name with '--' prefix>,
++//       syntax: <custom property syntax>,
++//       inherits: bool,
++//       initialValue: <computationally idempotent initial value>
++//     },
++//     ...
++//   ],
++//   grandparent: <style for grandparent element>,
++//   parent: <style for parent element>,
++//   child: <style for child element>,
++//   expected: {
++//     <computed property>: <expected value string>,
++//     ...
++//   },
++// }
++let familyTests = [
++  // Basic uninherited property.
++  { registrations: [
++      { name: "--a",
++        syntax: "<color>",
++        inherits: false,
++        initialValue: "red",
++      },
++    ],
++    grandparent: "--a: green;",
++    expected: {
++      "--a": "red",
++    },
++  },
++  // Transform function arguments should be computed.
++  { registrations: [
++      { name: "--a",
++        syntax: "<transform-list>",
++        inherits: true,
++      },
++    ],
++    parent: "font-size: 10px;",
++    child: "--a: translateX(5em);",
++    expected: {
++      "--a": "translateX(50px)",
++    },
++  },
++  // If no initialValue is provided and the syntax is *, then a special
++  // initial value used. This initial value must be considered parseable by
++  // registerProperty() but invalid at computed value time.
++  { registrations: [
++      { name: "--a",
++        syntax: "*",
++        inherits: true,
++      },
++    ],
++    parent: "--b: happy birthday; --b: hi var(--a);",
++    expected: {
++      // 'happy birthday' is overwritten in the cascade, and the var(--a)
++      // substitution is illegal.
++      "--b": "",
++    },
++  },
++  // Same as the previous test, with a fallback (i.e. we shouldn't quit before
++  // resolving).
++  { registrations: [
++      { name: "--a",
++        syntax: "*",
++        inherits: true,
++      },
++    ],
++    parent: "--b: happy birthday; --b: hi var(--a,to you);",
++    expected: {
++      // The leading space is part of the value!
++      "--b": " hi to you",
++    },
++  },
++  // Make sure we calculate font-relative lengths in lengths and
++  // length-percentages.
++  { registrations: [
++      { name: "--a",
++        syntax: "<length>",
++      },
++      { name: "--b",
++        syntax: "<length-percentage>",
++      },
++    ],
++    parent: "font-size: 15px",
++    child: "--a: 1em; --b: calc(1em + 20%);",
++    expected: {
++      "--a": "15px",
++      "--b": "calc(15px + 20%)",
++    },
++  },
++  // Make sure we set initial values on the root, even if nothing is ever
++  // specified.
++  { registrations: [
++      { name: "--a",
++        syntax: "<number>",
++        initialValue: "42",
++      },
++    ],
++    expected: {
++      "--a": "42",
++    },
++  },
++  // We should parse 'inherit' correctly in token stream values.
++  { registrations: [
++      { name: "--a",
++        syntax: "*",
++        inherits: false,
++      },
++    ],
++    parent: "--a: some-value",
++    child: "--a: inherit",
++    expected: {
++      "--a": " some-value",
++    },
++  },
++  // We should parse 'inherit' correctly in list values.
++  { registrations: [
++      { name: "--a",
++        syntax: "<number>+",
++        inherits: false,
++      },
++    ],
++    parent: "--a: 4 8 15",
++    child: "--a: inherit",
++    expected: {
++      "--a": "4 8 15",
++    },
++  },
++];
++
++for (let spec of familyTests) {
++  test(function () {
++    let registered = [];
++    try {
++      for (let registration of spec.registrations) {
++        CSS.registerProperty(registration);
++        registered.push(registration.name);
++      }
++
++      grandparent.setAttribute("style", spec.grandparent || "");
++      parent.setAttribute("style", spec.parent || "");
++      child.setAttribute("style", spec.child || "");
++
++      for (let key in spec.expected) {
++        assert_equals(window.getComputedStyle(child).getPropertyValue(key),
++          spec.expected[key], "property value equals expected value");
++      }
++    } finally {
++      grandparent.removeAttribute("style");
++      parent.removeAttribute("style");
++      child.removeAttribute("style");
++
++      for (let name of registered) {
++        CSS.unregisterProperty(name);
++      }
++    }
++  }, "family: " + JSON.stringify(spec));
++}
++</script>
+diff -r 5805d929bec9 tests/wpt/web-platform-tests/css/css-properties-values-api-1/independence.html
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/tests/wpt/web-platform-tests/css/css-properties-values-api-1/independence.html	Thu Jul 27 13:21:13 2017 -0700
+@@ -0,0 +1,37 @@
++<!doctype html>
++<meta charset=utf-8>
++<title>Bug 1273706 - Computational Independence (CSS Properties &amp; Values API Level 1)</title>
++<link rel="help" href="https://drafts.css-houdini.org/css-properties-values-api/#computationally-independent" />
++<script src=/resources/testharness.js></script>
++<script src=/resources/testharnessreport.js></script>
++<script src=common.js></script>
++<script>
++let independencePassTests = [
++  // https://github.com/w3c/css-houdini-drafts/issues/247
++  { syntax: "<color>", initialValue: "currentColor" },
++  { syntax: "<length>", initialValue: "5px" },
++  { syntax: "<length>", initialValue: "calc(5px + 7px)" },
++  { syntax: "<transform-list>", initialValue: "translateX(5px)" },
++  { syntax: "<transform-list>+", initialValue: "translateX(5px) translateX(-10px)" },
++  { syntax: "<custom-ident>+", initialValue: "does the code inherit the legacy of Netscape" },
++];
++
++let independenceFailTests = [
++  { syntax: "<color>", initialValue: "inherit" },
++  { syntax: "<length>", initialValue: "5em" },
++  { syntax: "<length>", initialValue: "calc(5px + 5em)" },
++  { syntax: "<transform-list>", initialValue: "translateX(5em)" },
++  { syntax: "<integer> | <length>+", initialValue: "5px 0 -5em 0 12px" },
++  { syntax: "<color> | <transform-list>+", initialValue: "translateX(-10em)" },
++  { syntax: "<number>+", initialValue: "1 2 3 4 initial" },
++  { syntax: "*", initialValue: "inherit" },
++];
++
++expectFail("independence fail", independenceFailTests, "SyntaxError",
++  "Initial values that are not computationally independent must trigger a " +
++  "SyntaxError.");
++
++expectSucceed("independence pass", independencePassTests,
++  "Initial values that are computationally independent must not trigger a " +
++  "SyntaxError.");
++</script>
+diff -r 5805d929bec9 tests/wpt/web-platform-tests/css/css-properties-values-api-1/naming.html
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/tests/wpt/web-platform-tests/css/css-properties-values-api-1/naming.html	Thu Jul 27 13:21:13 2017 -0700
+@@ -0,0 +1,32 @@
++<!doctype html>
++<meta charset=utf-8>
++<title>Bug 1273706 - (CSS Properties &amp; Values API Level 1)</title>
++<link rel="help" href="https://drafts.css-houdini.org/css-properties-values-api/#the-registerproperty-function" />
++<script src=/resources/testharness.js></script>
++<script src=/resources/testharnessreport.js></script>
++<script src=common.js></script>
++
++<script>
++let invalidNameTests = [
++  // https://drafts.csswg.org/css-syntax-3/#typedef-ident-token
++  { name: "-" },
++  { name: " " },
++  { name: "--!" },
++];
++
++let validNameTests = [
++  { name: "--" },
++  { name: "--5" },
++  { name: "--a" },
++  { name: "--A" },
++  { name: "--ç" },
++  { name: "--\\n" },
++];
++
++expectFail("invalid name", invalidNameTests, "SyntaxError",
++  "Attempting to register properties with a name that doesn’t correspond " +
++  "to the <custom-property-name> production must cause registerProperty() " +
++  "to throw a SyntaxError.");
++
++expectSucceed("valid name", validNameTests, "Allow valid custom property names.");
++</script>
+diff -r 5805d929bec9 tests/wpt/web-platform-tests/css/css-properties-values-api-1/registration.html
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/tests/wpt/web-platform-tests/css/css-properties-values-api-1/registration.html	Thu Jul 27 13:21:13 2017 -0700
+@@ -0,0 +1,80 @@
++<!doctype html>
++<meta charset=utf-8>
++<title>Bug 1273706 - Registration (CSS Properties &amp; Values API Level 1)</title>
++<link rel="help" href="https://drafts.css-houdini.org/css-properties-values-api/#the-registerproperty-function" />
++<script src=/resources/testharness.js></script>
++<script src=/resources/testharnessreport.js></script>
++<div id="sandbox"></div>
++<script>
++let sandbox = document.getElementById("sandbox");
++
++test(function () {
++  let caughtDuplicate = false;
++  CSS.registerProperty({ name: "--duplicate-ime" });
++  try {
++    CSS.registerProperty({ name: "--duplicate-ime" });
++    CSS.unregisterProperty("--duplicate-ime");
++  } catch (e) {
++    caughtDuplicate =
++      e instanceof DOMException &&
++      e.name == "InvalidModificationError";
++  }
++  assert_true(caughtDuplicate, "caught exception");
++}, "Attempting to register a property with a name that has already been " +
++   "registered should result in an InvalidModificationError.");
++
++test(function () {
++  let caughtNotFound = false;
++  try {
++    CSS.unregisterProperty("--not-found-nfe");
++  } catch (e) {
++    caughtNotFound =
++      e instanceof DOMException &&
++      e.name == "NotFoundError";
++  }
++  assert_true(caughtNotFound, "caught exception");
++}, "Attempting to unregister a property that doesn't exist should result in " +
++   "a NotFoundError.");
++
++test(function() {
++  CSS.registerProperty({ name: "--some-property", syntax: "*" });
++  sandbox.style.setProperty("--some-property", "hello world");
++  assert_equals(window.getComputedStyle(sandbox)
++                      .getPropertyValue("--some-property"),
++                "hello world",
++                "'hello world' should be a valid * value.");
++  CSS.unregisterProperty("--some-property");
++  CSS.registerProperty({ name: "--some-property", syntax: "<number>" });
++  try {
++    assert_equals(window.getComputedStyle(sandbox)
++      .getPropertyValue("--some-property"),
++      "",
++      "'hello world' should not be a valid <number> value.");
++  } finally {
++    CSS.unregisterProperty("--some-property");
++  }
++}, "If all declarations for a custom property becomes invalid after " +
++   "registrations change, we should no longer use any of them.");
++
++// No longer applicable post "Seattle resolution."
++// See https://github.com/w3c/css-houdini-drafts/issues/354
++//test(function() {
++//  sandbox.setAttribute("style", "--some-property: 12345; --some-property:hello world");
++//  assert_equals(window.getComputedStyle(sandbox)
++//                      .getPropertyValue("--some-property"),
++//                "hello world",
++//                "We should use the last declaration, because " +
++//                "--some-property has no type.");
++//  CSS.registerProperty({ name: "--some-property", syntax: "<number>" });
++//  try {
++//    assert_equals(window.getComputedStyle(sandbox)
++//                        .getPropertyValue("--some-property"),
++//                  "12345",
++//                  "We should update to no longer use the last declaration " +
++//                  "after --some-property becomes typed.");
++//  } finally {
++//    CSS.unregisterProperty("--some-property");
++//  }
++//}, "We should update to use an earlier declaration if subsequent " +
++//   "declarations become invalid when we change variable registrations.");
++</script>
+diff -r 5805d929bec9 tests/wpt/web-platform-tests/css/css-properties-values-api-1/syntax.html
+--- /dev/null	Thu Jan 01 00:00:00 1970 +0000
++++ b/tests/wpt/web-platform-tests/css/css-properties-values-api-1/syntax.html	Thu Jul 27 13:21:13 2017 -0700
+@@ -0,0 +1,90 @@
++<!doctype html>
++<meta charset=utf-8>
++<title>Bug 1273706 - Syntax (CSS Properties &amp; Values API Level 1)</title>
++<link rel="help" href="https://drafts.css-houdini.org/css-properties-values-api/#supported-syntax-strings" />
++<script src=/resources/testharness.js></script>
++<script src=/resources/testharnessreport.js></script>
++<script src=common.js></script>
++<script>
++let invalidSyntaxTests = [
++  { syntax: "<number>+ <color>" },
++  { syntax: "<i-don't-exist>+" },
++  { syntax: "" },
++  { syntax: "<number> || <color>" },
++  { syntax: "|"},
++  { syntax: "+", initialValue: "calc(5 + 7)" },
++  { syntax: "   ", initialValue: "calc(5 + 7)" },
++  { syntax: "initial" },
++  { syntax: "inherit" },
++  { syntax: "unset" },
++  // We don't support revert yet.
++  //{ syntax: "revert" },
++  { syntax: "* worn out places" },
++  { syntax: "* | worn | out | faces" },
++  { syntax: "*+" },
++  // https://github.com/w3c/css-houdini-drafts/issues/112#issuecomment-246874717
++  { syntax: "<color>  +" },
++];
++
++let validSyntaxTests = [
++  { syntax: "*" },
++  { syntax: "<color>" },
++  { syntax: " <color> " },
++
++  // Allow some CSS keywords, just not the CSS-wide keywords or revert.
++  { syntax: "center" },
++];
++
++let syntaxFailTests = [
++  { syntax: "<color>", initialValue: "5px" },
++  { syntax: "<transform-list>", initialValue: "red" },
++  { syntax: "<transform-list>+", initialValue: " " },
++  { syntax: "<resolution>", initialValue: "calc(0)" },
++  { syntax: "<custom-ident>", initialValue: "5px" },
++  { syntax: "to-me", initialValue: "who-are-you" },
++  { syntax: "<number>+", initialValue: "1 2 initial 3" },
++  { syntax: "*", initialValue: "initial" },
++  // https://drafts.csswg.org/css-variables/#syntax
++  // "While <declaration-value> must represent at least one token, that one
++  //  token may be whitespace. This implies that --foo: ; is valid, and the
++  //  corresponding var(--foo) call would have a single space as its
++  //  substitution value, but --foo:; is invalid."
++  { syntax: "*", initialValue: "" },
++];
++
++let syntaxPassTests = [
++  { syntax: "*", initialValue: "all around me are familiar faces" },
++  { syntax: "*", initialValue: "translateX(5px) 5em 73" },
++  { syntax: "<number>", initialValue: "5" },
++  { syntax: "<number> | <color>", initialValue: "red" },
++  { syntax: "<number>+", initialValue: "4 8 15 16 23 42" },
++  { syntax: "<number>+ | <url>", initialValue: "url(http://mozilla.org)" },
++  { syntax: "<transform-list>", initialValue: "translateX(5px)" },
++  { syntax: "<resolution>", initialValue: "5dpi" },
++  { syntax: "<custom-ident>", initialValue: "doesnt-really-matter" },
++  { syntax: "to-me", initialValue: "to-me" },
++  { syntax: "to-me | just-a-poor-boy", initialValue: "just-a-poor-boy" },
++  // https://drafts.csswg.org/css-variables/#syntax
++  // "While <declaration-value> must represent at least one token, that one
++  //  token may be whitespace. This implies that --foo: ; is valid, and the
++  //  corresponding var(--foo) call would have a single space as its
++  //  substitution value, but --foo:; is invalid."
++  { syntax: "*", initialValue: " " },
++];
++
++// Testing functions.
++
++expectFail("invalid syntax", invalidSyntaxTests, "SyntaxError",
++  "Invalid syntaxes must trigger a SyntaxError.");
++
++expectSucceed("valid syntax", validSyntaxTests,
++  "Valid syntaxes must not trigger a SyntaxError.");
++
++expectFail("syntax fail", syntaxFailTests, "SyntaxError",
++  "Initial values that are syntactically invalid must trigger a " +
++  "SyntaxError.");
++
++expectSucceed("syntax pass", syntaxPassTests,
++  "Initial values that are syntactically valid must not trigger a " +
++  "SyntaxError.");
++</script>

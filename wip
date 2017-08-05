@@ -1,0 +1,1373 @@
+# HG changeset patch
+# Parent  d04bef274d51e9703e6d4c84ed78ad3e40fd67f9
+
+diff -r d04bef274d51 -r c12161ca8728 Cargo.lock
+--- a/Cargo.lock	Thu Jul 27 13:21:13 2017 -0700
++++ b/Cargo.lock	Tue Aug 01 14:16:22 2017 -0700
+@@ -3081,17 +3081,16 @@ dependencies = [
+  "app_units 0.5.0 (registry+https://github.com/rust-lang/crates.io-index)",
+  "bitflags 0.7.0 (registry+https://github.com/rust-lang/crates.io-index)",
+  "cssparser 0.18.0 (registry+https://github.com/rust-lang/crates.io-index)",
+  "euclid 0.15.1 (registry+https://github.com/rust-lang/crates.io-index)",
+  "heapsize 0.4.0 (registry+https://github.com/rust-lang/crates.io-index)",
+  "heapsize_derive 0.1.4 (registry+https://github.com/rust-lang/crates.io-index)",
+  "selectors 0.19.0",
+  "serde 1.0.8 (registry+https://github.com/rust-lang/crates.io-index)",
+- "servo_atoms 0.0.1",
+ ]
+ 
+ [[package]]
+ name = "stylo_tests"
+ version = "0.0.1"
+ dependencies = [
+  "atomic_refcell 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
+  "cssparser 0.18.0 (registry+https://github.com/rust-lang/crates.io-index)",
+diff -r d04bef274d51 -r c12161ca8728 components/script/dom/css.rs
+--- a/components/script/dom/css.rs	Thu Jul 27 13:21:13 2017 -0700
++++ b/components/script/dom/css.rs	Tue Aug 01 14:16:22 2017 -0700
+@@ -1,34 +1,52 @@
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+-use app_units::Au;
+ use cssparser::{Parser, ParserInput, serialize_identifier};
+ use dom::bindings::codegen::Bindings::DocumentBinding::DocumentBinding::DocumentMethods;
+ use dom::bindings::codegen::Bindings::PropertyDescriptorDictBinding::PropertyDescriptorDict;
+ use dom::bindings::codegen::Bindings::WindowBinding::WindowBinding::WindowMethods;
+ use dom::bindings::error::{Error, Fallible};
+ use dom::bindings::inheritance::Castable;
+ use dom::bindings::reflector::Reflector;
+ use dom::bindings::str::DOMString;
+ use dom::node::{Node, NodeDamage};
+ use dom::window::Window;
+ use dom_struct::dom_struct;
+-use style::Atom;
+-use style::context::{SharedStyleContext, QuirksMode};
+-use style::font_metrics::FontMetricsProvider;
++use style::context::QuirksMode;
+ use style::parser::ParserContext;
+-use style::custom_properties;
+-use style::invalidation::element::restyle_hints::RestyleHint;
+-use style::properties_and_values::{Registration, Syntax};
++use style::properties_and_values::{self, PropertyRegistrationResult};
+ use style::stylesheets::CssRuleType;
+ use style::stylesheets::supports_rule::{Declaration, parse_condition_or_declaration};
+-use style_traits::{PARSING_MODE_DEFAULT, ToCss};
++use style_traits::PARSING_MODE_DEFAULT;
++
++fn handle_property_registration_result(
++    win: &Window,
++    result: PropertyRegistrationResult
++) -> Result<(), Error> {
++    match result {
++        PropertyRegistrationResult::Ok => {
++            //if let Some(ref element) = win.Document().GetDocumentElement() {
++            //    let mut entry = win.Document().ensure_pending_restyle(element);
++            //    entry.hint.insert(RestyleHint::restyle_subtree());
++            //}
++            // Should lead to the RestyleHint::restyle_subtree() being inserted
++            // eventually in handle_reflow due to checks in Stylist.
++            if let Some(element) = win.Document().GetDocumentElement() {
++                element.upcast::<Node>().dirty(NodeDamage::NodeStyleDamaged);
++            }
++            Ok(())
++        },
++        PropertyRegistrationResult::SyntaxError => Err(Error::Syntax),
++        PropertyRegistrationResult::InvalidModificationError => Err(Error::InvalidModification),
++        PropertyRegistrationResult::NotFoundError => Err(Error::NotFound),
++    }
++}
+ 
+ #[dom_struct]
+ pub struct CSS {
+     reflector_: Reflector,
+ }
+ 
+ impl CSS {
+     /// http://dev.w3.org/csswg/cssom/#serialize-an-identifier
+@@ -65,144 +83,39 @@ impl CSS {
+             cond.eval(&context)
+         } else {
+             false
+         }
+     }
+ 
+     // https://drafts.css-houdini.org/css-properties-values-api/#dom-css-registerproperty
+     pub fn RegisterProperty(win: &Window, options: &PropertyDescriptorDict) -> Result<(), Error> {
+-        use euclid::{ScaleFactor, TypedSize2D};
+-        use style::values::computed;
+-        use style::context::QuirksMode;
+-        use style::media_queries::MediaType;
+-        use style::properties::{ComputedValues, StyleBuilder};
+-        use style::servo::media_queries::Device;
+-        let phony_device = Device::new(
+-            MediaType::Screen,
+-            TypedSize2D::new(1024.0, 768.0),
+-            ScaleFactor::new(1.0),
+-        );
+-        let phony_font_metrics_provider = PhonyFontMetricsProvider;
+-        let phony_computed_context = computed::Context {
+-            is_root_element: false,
+-            builder: StyleBuilder::for_derived_style(
+-                &phony_device,
+-                ComputedValues::initial_values(),
+-                None,
+-                None,
+-            ),
+-            font_metrics_provider: &phony_font_metrics_provider,
+-            cached_system_font: None,
+-            in_media_query: false,
+-            quirks_mode: win.Document().quirks_mode(),
+-            for_smil_animation: false,
+-        };
+-
+-        let name = match custom_properties::parse_name((*options.name).into()) {
+-            Ok(name) => name,
+-            Err(()) => return Err(Error::Syntax),
+-        };
+-
+-        let syntax = match Syntax::from_string(&options.syntax) {
+-            Ok(syntax) => syntax,
+-            Err(()) => return Err(Error::Syntax),
+-        };
+-
+-        let initial_value = match options.initialValue {
+-            Some(ref specified) => {
+-                let url = win.Document().url();
+-                let context = ParserContext::new_for_cssom(
+-                    &url,
++        let registered_property_set = win.Document().registered_property_set();
++        let mut registered_property_set = registered_property_set.write();
++        handle_property_registration_result(
++            win,
++            properties_and_values::register_property(
++                &mut *registered_property_set,
++                &ParserContext::new_for_cssom(
++                    &win.Document().url(),
+                     win.css_error_reporter(),
+                     /* rule_type */ None,
+                     PARSING_MODE_DEFAULT,
+-                    win.Document().quirks_mode()
+-                );
+-                let mut input = ParserInput::new(specified);
+-                let mut input = Parser::new(&mut input);
+-                let parsed = match syntax.parse(&context, &mut input) {
+-                    Ok(parsed) => {
+-                        if parsed.is_computationally_independent() {
+-                            Some(parsed)
+-                        } else {
+-                            return Err(Error::Syntax)
+-                        }
+-                    },
+-                    _ => return Err(Error::Syntax)
+-                };
+-                // The initial value should be computationally independent, so
+-                // we should be able to "compute" it with a phony context.
+-                parsed.map(|parsed| {
+-                    parsed.to_computed_value(&phony_computed_context)
+-                          .expect("We should be always able to compute a parsed initial value.")
+-                })
+-            },
+-            None => None,
+-        };
+-
+-        let registered_property_set = win.Document().registered_property_set();
+-        let mut registered_property_set = registered_property_set.write();
+-        let result =
+-            registered_property_set
+-            .register_property(Registration {
+-                name: name.into(),
+-                syntax: syntax,
+-                inherits: options.inherits,
+-                initial_value: initial_value,
+-            })
+-            .or(Err(Error::InvalidModification));
+-
+-        if result.is_ok() {
+-            //if let Some(ref element) = win.Document().GetDocumentElement() {
+-            //    let mut entry = win.Document().ensure_pending_restyle(element);
+-            //    entry.hint.insert(RestyleHint::restyle_subtree());
+-            //}
+-            // Should lead to the RestyleHint::restyle_subtree() being inserted
+-            // eventually in handle_reflow due to checks in Stylist.
+-            if let Some(element) = win.Document().GetDocumentElement() {
+-                element.upcast::<Node>().dirty(NodeDamage::NodeStyleDamaged);
+-            }
+-        }
+-
+-        result
++                    win.Document().quirks_mode(),
++                ),
++                &*options.name,
++                &options.syntax,
++                options.inherits,
++                options.initialValue.as_ref().map(|x| &**x),
++            )
++        )
+     }
+ 
+     // https://drafts.css-houdini.org/css-properties-values-api/#dom-css-unregisterproperty
+     pub fn UnregisterProperty(win: &Window, name: DOMString) -> Result<(), Error> {
+-        let name = match custom_properties::parse_name(&*name) {
+-            Ok(name) => name,
+-            Err(()) => return Err(Error::Syntax),
+-        };
+         let registered_property_set = win.Document().registered_property_set();
+         let mut registered_property_set = registered_property_set.write();
+-        let result =
+-            registered_property_set
+-            .unregister_property(&name.into())
+-            .or(Err(Error::NotFound));
+-
+-        if result.is_ok() {
+-            //win.Document().GetDocumentElement().
+-            if let Some(element) = win.Document().GetDocumentElement() {
+-                element.upcast::<Node>().dirty(NodeDamage::NodeStyleDamaged);
+-            }
+-            // how is reflow getting triggered?
+-            //if let Some(ref element) = win.Document().GetDocumentElement() {
+-            //    let mut entry = win.Document().ensure_pending_restyle(element);
+-            //    entry.hint.insert(RestyleHint::restyle_subtree());
+-            //}
+-        }
+-
+-        result
++        handle_property_registration_result(
++            win,
++            properties_and_values::unregister_property(&mut *registered_property_set, &*name)
++        )
+     }
+ }
+-
+-#[derive(Debug)]
+-struct PhonyFontMetricsProvider;
+-
+-impl FontMetricsProvider for PhonyFontMetricsProvider {
+-    fn get_size(&self, _font_name: &Atom, _font_family: u8) -> Au {
+-        Au(0)
+-    }
+-    fn create_from(_context: &SharedStyleContext) -> Self where Self: Sized {
+-        PhonyFontMetricsProvider
+-    }
+-}
+diff -r d04bef274d51 -r c12161ca8728 components/style/gecko/data.rs
+--- a/components/style/gecko/data.rs	Thu Jul 27 13:21:13 2017 -0700
++++ b/components/style/gecko/data.rs	Tue Aug 01 14:16:22 2017 -0700
+@@ -13,16 +13,17 @@ use gecko_bindings::bindings::{self, Raw
+ use gecko_bindings::structs::{ServoStyleSheet, StyleSheetInfo, ServoStyleSheetInner};
+ use gecko_bindings::structs::RawGeckoPresContextOwned;
+ use gecko_bindings::structs::nsIDocument;
+ use gecko_bindings::sugar::ownership::{HasArcFFI, HasBoxFFI, HasFFI, HasSimpleFFI};
+ use invalidation::media_queries::{MediaListKey, ToMediaListKey};
+ use media_queries::{Device, MediaList};
+ use parking_lot::RwLock;
+ use properties::ComputedValues;
++use properties_and_values::RegisteredPropertySet;
+ use servo_arc::Arc;
+ use shared_lock::{Locked, StylesheetGuards, SharedRwLockReadGuard};
+ use stylesheet_set::StylesheetSet;
+ use stylesheets::{Origin, StylesheetContents, StylesheetInDocument};
+ use stylist::{ExtraStyleData, Stylist};
+ 
+ /// Little wrapper to a Gecko style sheet.
+ #[derive(PartialEq, Eq, Debug)]
+@@ -121,42 +122,38 @@ pub struct PerDocumentStyleDataImpl {
+     /// List of stylesheets, mirrored from Gecko.
+     pub stylesheets: StylesheetSet<GeckoStyleSheet>,
+ 
+     /// List of effective font face rules.
+     pub font_faces: Vec<(Arc<Locked<FontFaceRule>>, Origin)>,
+ 
+     /// Map for effective counter style rules.
+     pub counter_styles: FnvHashMap<Atom, Arc<Locked<CounterStyleRule>>>,
+-
+-    /// The set of registered custom properties.
+-    pub registered_property_set: Arc<RwLock<RegisteredPropertySet>>,
+ }
+ 
+ /// The data itself is an `AtomicRefCell`, which guarantees the proper semantics
+ /// and unexpected races while trying to mutate it.
+ pub struct PerDocumentStyleData(AtomicRefCell<PerDocumentStyleDataImpl>);
+ 
+ impl PerDocumentStyleData {
+     /// Create a dummy `PerDocumentStyleData`.
+     pub fn new(pres_context: RawGeckoPresContextOwned) -> Self {
+         let device = Device::new(pres_context);
+         let quirks_mode = unsafe {
+             (*device.pres_context().mDocument.raw::<nsIDocument>()).mCompatMode
+         };
+-        let stylist = Stylist::new(device, quirks_mode.into());
++        let mut stylist = Stylist::new(device, quirks_mode.into());
+         let registered_property_set: Arc<RwLock<RegisteredPropertySet>> = Default::default();
+-        stylist.set_registered_proeprty_set(registered_property_set);
++        stylist.set_registered_property_set(registered_property_set);
+ 
+         PerDocumentStyleData(AtomicRefCell::new(PerDocumentStyleDataImpl {
+-            stylist: ,
++            stylist: stylist,
+             stylesheets: StylesheetSet::new(),
+             font_faces: vec![],
+             counter_styles: FnvHashMap::default(),
+-            registered_property_set: registered_property_set,
+         }))
+     }
+ 
+     /// Get an immutable reference to this style data.
+     pub fn borrow(&self) -> AtomicRef<PerDocumentStyleDataImpl> {
+         self.0.borrow()
+     }
+ 
+diff -r d04bef274d51 -r c12161ca8728 components/style/lib.rs
+--- a/components/style/lib.rs	Thu Jul 27 13:21:13 2017 -0700
++++ b/components/style/lib.rs	Tue Aug 01 14:16:22 2017 -0700
+@@ -72,17 +72,17 @@ extern crate parking_lot;
+ extern crate pdqsort;
+ #[cfg(feature = "gecko")] extern crate precomputed_hash;
+ extern crate rayon;
+ extern crate selectors;
+ #[cfg(feature = "servo")] #[macro_use] extern crate serde;
+ pub extern crate servo_arc;
+ #[cfg(feature = "servo")] #[macro_use] extern crate servo_atoms;
+ #[cfg(feature = "servo")] extern crate servo_config;
+-extern crate servo_url;
++#[cfg(feature = "servo")] extern crate servo_url;
+ extern crate smallvec;
+ #[macro_use]
+ extern crate style_derive;
+ #[macro_use]
+ extern crate style_traits;
+ extern crate time;
+ extern crate unicode_bidi;
+ #[allow(unused_extern_crates)]
+diff -r d04bef274d51 -r c12161ca8728 components/style/properties/properties.mako.rs
+--- a/components/style/properties/properties.mako.rs	Thu Jul 27 13:21:13 2017 -0700
++++ b/components/style/properties/properties.mako.rs	Tue Aug 01 14:16:22 2017 -0700
+@@ -43,17 +43,16 @@ use style_traits::{PARSING_MODE_DEFAULT,
+ use style_traits::{PropertyDeclarationParseError, StyleParseError};
+ use stylesheets::{CssRuleType, MallocSizeOf, MallocSizeOfFn, Origin, UrlExtraData};
+ #[cfg(feature = "servo")] use values::Either;
+ use values::generics::text::LineHeight;
+ use values::computed;
+ use cascade_info::CascadeInfo;
+ use rule_tree::{CascadeLevel, StrongRuleNode};
+ use self::computed_value_flags::ComputedValueFlags;
+-use servo_url::ServoUrl;
+ use style_adjuster::StyleAdjuster;
+ #[cfg(feature = "servo")] use values::specified::BorderStyle;
+ 
+ pub use self::declaration_block::*;
+ 
+ #[cfg(feature = "gecko")]
+ #[macro_export]
+ macro_rules! property_name {
+@@ -3030,16 +3029,61 @@ fn compute_resolved_custom_property(
+         match registration.syntax.parse(&parser_context, &mut input) {
+             Ok(x) => x,
+             Err(_) => return Err(()),
+         }
+     };
+     specified.to_computed_value(context).map(|x| x.into())
+ }
+ 
++fn substitute_all(
++    context: &computed::Context,
++    registered_property_set: &RegisteredPropertySet,
++    specified: &HashMap<<&::custom_properties::Name,
++                         ::custom_properties::BorrowedSpecifiedValue>,
++    inherited: &Option<Arc<::custom_properties::CustomPropertiesMap>>,
++    to_substitute: &Option<HashSet<::custom_properties::Name>>,
++    computed: &mut ::custom_properties::CustomPropertiesMap,
++) {
++    ::custom_properties::substitute_all(
++        specified,
++        to_substitute,
++        computed,
++        /* compute */ &mut |name, value| {
++            let specified = specified.get(name).unwrap();
++            if let Some(ref url_data) = specified.url_data {
++                compute_resolved_custom_property(
++                    registered_property_set,
++                    context,
++                    url_data,
++                    name,
++                    value
++                )
++            } else {
++                // This is an inherited custom property. Don't need to
++                // re-compute.
++                Ok(value)
++            }
++        },
++        /* handle_invalid */ &|name| {
++            registered_property_set
++                .get(name)
++                .and_then(|registration| {
++                    if !registration.inherits {
++                        registration.initial_value.clone().map(|x| x.to_computed_value(context).unwrap().into())
++                    } else {
++                        None
++                    }
++                })
++                .or_else(|| inherited.as_ref().and_then(|x| x.get_computed_value(name).cloned()))
++                .ok_or(())
++        }
++    );
++}
++
+ fn compute_early_custom_properties<'a, 'b: 'a, I>(
+     context: &computed::Context,
+     inherited: &'a Option<Arc<::custom_properties::CustomPropertiesMap>>,
+     declarations: I,
+     registered_property_set: &RwLock<RegisteredPropertySet>,
+ ) -> (
+     Option<HashMap<<&'a ::custom_properties::Name,
+                     ::custom_properties::BorrowedSpecifiedValue<'a>>>,
+@@ -3060,17 +3104,17 @@ where I: Iterator<Item = (&'b PropertyDe
+     let mut seen_custom = HashSet::new();
+     // Don't really need this, but parse_declaration_value_block expects it.
+     let mut missing_closing_characters = String::new();
+     for (declaration, _cascade_level) in declarations {
+         match *declaration {
+             PropertyDeclaration::Custom(ref name, ref value) => {
+                 ::custom_properties::cascade(
+                     &mut specified,
+-                    &inherited,
++                    inherited,
+                     /* handle_keyword */ |name, keyword| {
+                         use ::custom_properties::KeywordAction;
+                         match keyword {
+                             CSSWideKeyword::Initial => {
+                                 if let Some(registration) = registered_property_set.get(name) {
+                                     if registration.initial_value.is_some() {
+                                         KeywordAction::UseInitial
+                                     } else {
+@@ -3133,18 +3177,16 @@ where I: Iterator<Item = (&'b PropertyDe
+             },
+             _ => (),
+         }
+     }
+ 
+     let referenced_by_font_size = referenced_by_font_size.unwrap();
+     let referenced_by_other_early = referenced_by_other_early.unwrap();
+ 
+-    let phony_url = ServoUrl::parse("http://example.com").unwrap();
+-
+     // Remove cycles and compute those custom properties depended on by early
+     // properties.
+     let (computed_early, font_size_cyclical) = {
+         if let Some(ref mut specified) = specified {
+             let (font_size_cyclical, dependencies, cyclical) = {
+                 ::custom_properties::analyze_dependencies(
+                     specified,
+                     &referenced_by_font_size,
+@@ -3156,94 +3198,69 @@ where I: Iterator<Item = (&'b PropertyDe
+             // Note that inherited properties will have already been inserted
+             // into `specified` by ::custom_properties::cascade.
+             // If a property isn't specified and is either
+             // a) uninherited or has no inherited value, and
+             // b) has an initial value,
+             // then we should set it to its initial value.
+             let mut computed = {
+                 let has_value = specified.iter().map(|(name, _)| name.clone()).collect();
+-                registered_property_set.initial_values_except(Some(&has_value))
++                registered_property_set.initial_values_except(context, Some(&has_value))
+             };
+ 
+             for name in cyclical {
+                 specified.remove(&name);
+                 // "If there is a cycle in the dependency graph, all the custom
+                 //  properties in the cycle must compute to their initial value
+                 //  (which is a guaranteed-invalid value)."
+                 // -- https://drafts.csswg.org/css-variables/#cycles
+                 let initial_value =
+                     registered_property_set
+                     .get(&name)
+                     .and_then(|registration| registration.initial_value.clone())
+-                    .map(|initial_value| initial_value.into());
++                    .map(|initial_value| initial_value.to_computed_value(context).unwrap().into());
+                 if let Some(initial_value) = initial_value {
+                     computed.insert(&name, initial_value)
+                 }
+             }
+ 
+-            ::custom_properties::substitute_all(
++            substitute_all(
++                context,
++                &*registered_property_set,
+                 specified,
+-                &Some(dependencies),
+-                /*&inherited,*/
+-                &mut computed,
+-                /* compute */ &|name, value| {
+-                    compute_resolved_custom_property(
+-                        &*registered_property_set,
+-                        context,
+-                        // The second unwrap will fail if this
+-                        // BorrowedSpecifiedValue came from an inherited
+-                        // declaration. Inherited declarations should
+-                        // already have been computed if necessary.
+-                        specified.get(name).unwrap()
+-                                 .url_data.unwrap_or(&phony_url),
+-                        name,
+-                        value,
+-                    )
+-                },
+-                /* handle_invalid */ &|name| {
+-                    registered_property_set
+-                        .get(name)
+-                        .and_then(|registration| {
+-                            if !registration.inherits {
+-                                registration.initial_value.clone().map(|x| x.into())
+-                            } else {
+-                                None
+-                            }
+-                        })
+-                        .or_else(|| inherited.as_ref().and_then(|x| x.get_computed_value(name).cloned()))
+-                        .ok_or(())
+-                }
++                inherited,
++                /* to_substitute */ &Some(dependencies),
++                &mut computed
+             );
+ 
+             (Some(Arc::new(computed)), font_size_cyclical)
+         } else if let &Some(ref inherited) = inherited {
+             let uninherited_properties = registered_property_set.uninherited_properties();
+             if !uninherited_properties.is_empty() {
+                 let mut computed = ::custom_properties::CustomPropertiesMap::new();
+                 for (name, value) in inherited.iter() {
+                     if !uninherited_properties.contains(name) {
+                         computed.insert(name, (*value).clone());
+                     } else {
+                         let registration = registered_property_set.get(name).unwrap();
+                         if let Some(ref initial) = registration.initial_value {
+-                            computed.insert(name, (*initial).clone().into());
++                            computed.insert(name, (*initial).clone().to_computed_value(context).unwrap().into());
+                         }
+                     }
+                 }
+                 (Some(Arc::new(computed)), false)
+             } else {
+                 // Arc, so should be cheap.
+                 (Some((*inherited).clone()), false)
+             }
+         } else {
+             // No inherited or specified values.
+             // If there are any properties with initial values, we should set
+             // them.
+-            (Some(Arc::new(registered_property_set.initial_values_except(None))), false)
++            (Some(Arc::new(registered_property_set.initial_values_except(context, None))), false)
+         }
+     };
+ 
+     (specified, computed_early, font_size_cyclical)
+ }
+ 
+ /// NOTE: This function expects the declaration with more priority to appear
+ /// first.
+@@ -3367,58 +3384,26 @@ where
+                 // can update it. (We still need to pass context in to compute
+                 // with). We'll swap it back in at the end!
+                 let mut maybe_arc = None;
+                 mem::swap(&mut maybe_arc, &mut context.builder.custom_properties);
+ 
+                 {
+                     let mut arc = maybe_arc.as_mut().unwrap();
+                     let mut computed_custom_properties = Arc::get_mut(arc).unwrap();
+-
+                     let specified_custom_properties = specified_custom_properties.as_ref().unwrap();
+                     let registered_property_set = registered_property_set.read();
+-
+-                    let phony_url = ServoUrl::parse("http://example.com").unwrap();
+-
+-                    // XXX when can context.builder.custom_properties be Some yet
+-                    // specified is None?
+-
+-                    ::custom_properties::substitute_all(
++                    substitute_all(
++                        &context,
++                        &*registered_property_set,
+                         specified_custom_properties,
++                        &inherited_custom_properties,
+                         // Compute everybody that isn't yet computed.
+                         /* to_substitute */ &None,
+-                        /* &inherited_custom_properties, */
+-                        computed_custom_properties,
+-                        /* compute */ &mut |name, value| {
+-                            compute_resolved_custom_property(
+-                                &*registered_property_set,
+-                                &context,
+-                                specified_custom_properties.get(name).unwrap()
+-                                                           .url_data.unwrap_or(&phony_url),
+-                                name,
+-                                value
+-                            )
+-                        },
+-                        /* handle_invalid */ &|name| {
+-                            registered_property_set
+-                                .get(name)
+-                                .and_then(|registration| {
+-                                    if !registration.inherits {
+-                                        registration.initial_value.clone().map(|x| x.into())
+-                                    } else {
+-                                        None
+-                                    }
+-                                })
+-                                .or_else(|| {
+-                                    inherited_custom_properties
+-                                        .as_ref()
+-                                        .and_then(|x| x.get_computed_value(name).cloned())
+-                                })
+-                                .ok_or(())
+-                        }
++                        computed_custom_properties
+                     );
+                 }
+ 
+                 mem::swap(&mut maybe_arc, &mut context.builder.custom_properties);
+             }
+         % endif
+         for (declaration, cascade_level) in iter_declarations() {
+             let mut declaration = match *declaration {
+diff -r d04bef274d51 -r c12161ca8728 components/style/properties_and_values.rs
+--- a/components/style/properties_and_values.rs	Thu Jul 27 13:21:13 2017 -0700
++++ b/components/style/properties_and_values.rs	Tue Aug 01 14:16:22 2017 -0700
+@@ -5,55 +5,65 @@
+ #![allow(missing_docs, warnings)]
+ 
+ //! Support for the [Properties & Values API][spec].
+ //!
+ //! [spec]: https://drafts.css-houdini.org/css-properties-values-api-1/
+ 
+ use app_units::Au;
+ use Atom;
++use context::SharedStyleContext;
+ use cssparser::{BasicParseError, Delimiter, ParseError, ParserInput, Parser, Token};
+ use custom_properties::{self, CustomPropertiesMap, Name};
++use font_metrics::FontMetricsProvider;
++use media_queries::Device;
+ use parser::{Parse, ParserContext};
+ use properties::longhands::transform;
+ use properties::{CSSWideKeyword};
+-use servo_url::ServoUrl;
+ use selectors::parser::SelectorParseError;
+ use std::collections::{HashMap, HashSet};
+ use std::fmt;
+ use std::ops::Deref;
+ use std::vec::Vec;
+ use style_traits::{ParseError as StyleTraitsParseError, StyleParseError};
+ use style_traits::values::{OneOrMoreSeparated, Space, ToCss};
+ use style_traits::values::specified::AllowedLengthType;
+ use values;
+ use values::computed::{self, ComputedValueAsSpecified, ToComputedValue};
+ use values::specified;
+ 
+ /// A registration for a custom property.
+-#[derive(HeapSizeOf)]
++#[cfg_attr(feature = "servo", derive(HeapSizeOf))]
+ pub struct Registration {
+     /// The custom property name, sans leading '--'.
+     pub name: Name,
+     /// The syntax of the custom property.
+     pub syntax: Syntax,
+     /// Whether the custom property is inherited down the DOM tree.
+     pub inherits: bool,
+     /// The initial value of the custom property.
++    ///
+     /// Ideally we'd merge this with `syntax` so that illegal states would be
+-    /// unrepresentable. But while we could do that by turning the fields of
+-    /// the SpecifiedVariableLength variants into Option<T>'s, we would need a
+-    /// more expressive type system to do this with disjunctions.
+-    pub initial_value: Option<ComputedValue>,
++    /// unrepresentable. But while we could do that by turning the fields of the
++    /// SpecifiedVariable variants into Option<T>'s, we would need a more
++    /// expressive type system to do this with disjunctions.
++    ///
++    /// Ideally this would also be a ComputedValue. But to reuse the
++    /// to_computed_value code we need a style::values::computed::Context, which
++    /// is a real pain to construct in a nice way for both Stylo & Servo.
++    /// Instead we just store the specified value and compute this later; the
++    /// is_computationally_independent check should mean this doesn't matter.
++    pub initial_value: Option<SpecifiedValue>,
+ }
+ 
+ /// A versioned set of registered custom properties, stored on the document.
+ /// The [[registeredPropertySet]] of the spec. We keep track of the version to
+ /// know if we need to recompute which declarations are valid.
+-#[derive(Default, HeapSizeOf)]
++#[derive(Default)]
++#[cfg_attr(feature = "servo", derive(HeapSizeOf))]
+ pub struct RegisteredPropertySet {
+     /// The set of registered custom properties. Names are sans leading '--'.
+     registrations: HashMap<Name, Registration>,
+     /// The current version. Must be incremented whenever `registrations` is
+     /// modified.
+     generation: u32,
+ }
+ 
+@@ -91,82 +101,239 @@ impl RegisteredPropertySet {
+         self.registrations
+             .iter()
+             .filter(|&(_, registration)| !registration.inherits)
+             .map(|(name, _)| name)
+             .collect()
+     }
+ 
+     // XXX cache
+-    pub fn initial_values_except(&self, except: Option<&HashSet<&Name>>) -> CustomPropertiesMap {
++    pub fn initial_values_except(
++        &self,
++        context: &computed::Context,
++        except: Option<&HashSet<&Name>>
++    ) -> CustomPropertiesMap {
+         let mut map = CustomPropertiesMap::new();
+         for (name, registration) in self.registrations.iter() {
+             if except.map(|x| x.contains(name)).unwrap_or(false) {
+                 continue
+             }
+             if let Some(ref initial) = registration.initial_value {
+-                map.insert(name, initial.clone().into());
++                map.insert(name, initial.clone().to_computed_value(context).unwrap().into());
+             }
+         }
+         map
+     }
+ }
+ 
++/// Should be kept in sync with mozilla::PropertyRegistrationResult on the Gecko
++/// side.
++pub enum PropertyRegistrationResult {
++    Ok = 0,
++    SyntaxError,
++    InvalidModificationError,
++    NotFoundError,
++}
++
++/*
++fn phony_computed_context<'a>(
++    parser_context: &ParserContext
++) -> (Device, PhonyFontMetricsProvider, computed::Context<'a>) {
++    use euclid::{ScaleFactor, TypedSize2D};
++    use values::computed;
++    use media_queries::MediaType;
++    use properties::{ComputedValues, StyleBuilder};
++    use servo::media_queries::Device;
++
++    #[cfg(feature = "gecko")]
++    let phony_device = Device::new(
++        MediaType::Screen,
++        TypedSize2D::new(1024.0, 768.0),
++        ScaleFactor::new(1.0),
++    );
++
++    #[cfg(feature = "servo")]
++    let phony_device = 
++
++    let phony_font_metrics_provider = PhonyFontMetricsProvider;
++    let phony_computed_context = computed::Context {
++        is_root_element: false,
++        builder: StyleBuilder::for_derived_style(
++            &phony_device,
++            #[cfg(feature = "servo")]
++            ComputedValues::initial_values(),
++            #[cfg(feature = "gecko")]
++            phony_device.default_computed_values(),
++            None,
++            None,
++        ),
++        font_metrics_provider: &phony_font_metrics_provider,
++        cached_system_font: None,
++        in_media_query: false,
++        quirks_mode: parser_context.quirks_mode,
++        for_smil_animation: false,
++    };
++}
++*/
++
++pub fn register_property(
++    registered_property_set: &mut RegisteredPropertySet,
++    parser_context: &ParserContext,
++    name: &str,
++    syntax: &str,
++    inherits: bool,
++    initial_value: Option<&str>
++) -> PropertyRegistrationResult {
++
++    let name = match custom_properties::parse_name(name) {
++        Ok(name) => name,
++        Err(()) => return PropertyRegistrationResult::SyntaxError,
++    };
++
++    let syntax = match Syntax::from_string(syntax) {
++        Ok(syntax) => syntax,
++        Err(()) => return PropertyRegistrationResult::SyntaxError,
++    };
++
++    let initial_value = match initial_value {
++        Some(ref specified) => {
++            let mut input = ParserInput::new(specified);
++            let mut input = Parser::new(&mut input);
++            match syntax.parse(parser_context, &mut input) {
++                Ok(parsed) => {
++                    if parsed.is_computationally_independent() {
++                        Some(parsed)
++                    } else {
++                        return PropertyRegistrationResult::SyntaxError
++                    }
++                },
++                _ => return PropertyRegistrationResult::SyntaxError,
++            }
++            /*
++            // The initial value should be computationally independent, so
++            // we should be able to "compute" it with a phony context.
++            parsed.map(|parsed| {
++                parsed.to_computed_value(&phony_computed_context)
++                      .expect("We should be always able to compute a parsed initial value.")
++            })*/
++        },
++        None => None,
++    };
++
++    let result =
++        registered_property_set
++        .register_property(Registration {
++            name: name.into(),
++            syntax: syntax,
++            inherits: inherits,
++            initial_value: initial_value,
++        });
++
++    match result {
++        Ok(_) => PropertyRegistrationResult::Ok,
++        Err(_) => PropertyRegistrationResult::InvalidModificationError,
++    }
++}
++
++pub fn unregister_property(
++    registered_property_set: &mut RegisteredPropertySet,
++    name: &str
++) -> PropertyRegistrationResult {
++    let name = match custom_properties::parse_name(name) {
++        Ok(name) => name,
++        Err(()) => return PropertyRegistrationResult::SyntaxError,
++    };
++
++    let result =
++        registered_property_set
++        .unregister_property(&name.into());
++
++    match result {
++        Ok(_) => PropertyRegistrationResult::Ok,
++        Err(_) => PropertyRegistrationResult::NotFoundError,
++    }
++}
++
++
++#[derive(Debug)]
++struct PhonyFontMetricsProvider;
++
++impl FontMetricsProvider for PhonyFontMetricsProvider {
++    fn get_size(&self, _font_name: &Atom, _font_family: u8) -> Au {
++        Au(0)
++    }
++    fn create_from(_context: &SharedStyleContext) -> Self where Self: Sized {
++        PhonyFontMetricsProvider
++    }
++}
++
+ // We make a newtype for Atom and implement ToCss ourselves because the
+ // ToCss implementation for atom in `style_traits::values` uses `cssparsers`'s
+ // `serialize_string` function, which writes a double-quoted CSS string. We're
+ // only storing <custom-idents>, which should be serialized as specified.
+ 
+-#[derive(Clone, Debug, HeapSizeOf, PartialEq)]
++#[derive(Clone, Debug, PartialEq)]
++#[cfg_attr(feature = "servo", derive(HeapSizeOf))]
+ pub struct Ident(pub Atom);
+ 
+ impl ComputedValueAsSpecified for Ident {}
+ 
+ impl ToCss for Ident {
++    #[cfg(feature = "servo")]
+     fn to_css<W>(&self, dest: &mut W) -> fmt::Result where W: fmt::Write {
+-        dest.write_str(&*self)
++        dest.write_str(&*self.0)
++    }
++
++    #[cfg(feature = "gecko")]
++    fn to_css<W>(&self, dest: &mut W) -> fmt::Result where W: fmt::Write {
++        dest.write_str(&self.0.to_string())
+     }
+ }
+ 
+ impl Deref for Ident {
+     type Target = Atom;
+ 
+     fn deref(&self) -> &Atom {
+         &self.0
+     }
+ }
+ 
+ // We need to output the resolved URL.
+ 
+-#[derive(Clone, Debug, HeapSizeOf)]
++#[derive(Clone, Debug)]
++#[cfg_attr(feature = "servo", derive(HeapSizeOf))]
+ pub struct ComputedUrl(pub String);
+ 
+ impl ComputedUrl {
+     #[cfg(feature = "servo")]
+     fn from_specified(url: &specified::url::SpecifiedUrl) -> Result<ComputedUrl, ()> {
+         url.url().map(|x| ComputedUrl(x.as_str().to_owned())).ok_or(())
+     }
+ 
+     #[cfg(feature = "gecko")]
+     fn from_specified(url: &specified::url::SpecifiedUrl) -> Result<ComputedUrl, ()> {
+-        url.extra_data.join(url.as_str()).map(|x| ComputedUrl(x.as_str().to_owned())).ok_or(())
++        // Doesn't work.
++        // url.extra_data.join(url.as_str()).map(|x| ComputedUrl(x.as_str().to_owned())).ok_or(())
++        Ok(ComputedUrl(url.as_str().to_owned()))
++        // Note: the Gecko binding doesn't currently output resolved URLs.
+     }
+ }
+ 
+ impl ToCss for ComputedUrl {
+     fn to_css<W>(&self, dest: &mut W) -> fmt::Result where W: fmt::Write {
+         dest.write_str("url(")?;
+         self.0.to_css(dest)?;
+         dest.write_str(")")
+     }
+ }
+ 
+ /// A basic custom property syntax string for a custom property that, used to
+ /// build up disjunctions and list terms.
+-#[derive(Debug, HeapSizeOf, PartialEq)]
++#[derive(Debug, PartialEq)]
++#[cfg_attr(feature = "servo", derive(HeapSizeOf))]
+ pub enum Type {
+     /// Syntax to allow any valid <length> value.
+     Length,
+     /// Syntax to allow any valid <number> value.
+     Number,
+     /// Syntax to allow any valid <percentage> value.
+     Percentage,
+     /// Syntax to allow any valid <length> or <percentage> value, or any valid
+@@ -190,25 +357,36 @@ pub enum Type {
+     TransformList,
+     /// Syntax to allow any valid <custom-ident> value.
+     CustomIdent,
+     /// Syntax to allow a specific identifier (matching the <custom-ident>
+     /// production, compared codepoint-wise).
+     SpecificIdent(Ident),
+ }
+ 
++
+ impl Type {
+     /// In the case of transform functions, we always return a list.
+     /// Caller should check whether a list is expected.
+     pub fn parse<'i, 't>(
+         &self,
+         context: &ParserContext,
+         input: &mut Parser<'i, 't>
+     ) -> Result<SpecifiedValueItem, StyleTraitsParseError<'i>>
+     {
++        #[cfg(feature = "servo")]
++        fn idents_eq(a: &Atom, b: &str) -> bool {
++            a == b
++        }
++
++        #[cfg(feature = "gecko")]
++        fn idents_eq(a: &Atom, b: &str) -> bool {
++            *a == b.into()
++        }
++
+         macro_rules! parse {
+             ($_self:expr, $context:expr, $input:expr,
+ 
+              $($typ:ident => $fn:path),*) => {
+                 match $_self {
+                     $(
+                         Type::$typ => {
+                             $fn(context, input).map(|x| {
+@@ -216,17 +394,17 @@ impl Type {
+                             })
+                         }
+                     ),*
+ 
+                     // We need to actually compare SpecificIdents,
+                     // unfortunately.
+                     Type::SpecificIdent(ref x) => {
+                         $input.expect_ident_cloned().and_then(|y| {
+-                            if ***x == *y {
++                            if idents_eq(&**x, &*y) {
+                                 Ok(SpecifiedValueItem::SpecificIdent(x.clone()))
+                             } else {
+                                 Err(BasicParseError::UnexpectedToken(Token::Ident(y)).into())
+                             }
+                         }).map_err(|e| e.into())
+                     },
+                 }
+             };
+@@ -267,24 +445,26 @@ impl Type {
+     }
+ }
+ 
+ 
+ /// A custom property syntax string that is either some basic syntax string
+ /// (e.g. some <url> value) or some list term. A list term syntax string allows
+ /// a space-separated list of one or more repetitions of the type specified by
+ /// the string. Used to build up disjunctions.
+-#[derive(Debug, HeapSizeOf, PartialEq)]
++#[derive(Debug, PartialEq)]
++#[cfg_attr(feature = "servo", derive(HeapSizeOf))]
+ pub struct Term {
+     pub typ: Type,
+     pub list: bool,
+ }
+ 
+ /// A custom property syntax string.
+-#[derive(Debug, HeapSizeOf, PartialEq)]
++#[derive(Debug, PartialEq)]
++#[cfg_attr(feature = "servo", derive(HeapSizeOf))]
+ pub enum Syntax {
+     /// Syntax to allow any token stream (written '*').
+     Anything,
+     /// Syntax to allow some disjunction of terms (possibly list terms), which
+     /// allows any value matching one of the items in the combination, matched
+     /// in specified order (written 'a | b | ...').
+     Disjunction(Vec<Term>),
+ }
+@@ -526,19 +706,28 @@ impl Syntax {
+         &self,
+         context: &ParserContext,
+         input: &mut Parser<'i, 't>
+     ) -> Result<SpecifiedValue, StyleTraitsParseError<'i>>
+     {
+         let start = input.position();
+         match *self {
+             Syntax::Anything => {
+-                // Don't allow CSS-wide keywords: these should have been handled by
+-                // whoever is parsing the declaration.
+                 custom_properties::SpecifiedValue::parse(context, input)
++                    // Don't allow variable references: they should habe been
++                    // expanded by now.
++                    .and_then(|x| {
++                        if x.has_references() {
++                            Err(BasicParseError::UnexpectedToken(Token::Function("var".into())).into())
++                        } else {
++                            Ok(x)
++                        }
++                    })
++                    // Don't allow CSS-wide keywords: these should have been handled by
++                    // whoever is parsing the declaration.
+                     .and_then(|x| {
+                         match CSSWideKeyword::from_ident(&x.css) {
+                             Some(_) => Err(BasicParseError::UnexpectedToken(Token::Ident(x.css.into())).into()),
+                             None => Ok(SpecifiedValue::Item(SpecifiedValueItem::TokenStream(*x)))
+                         }
+                     })
+             },
+             Syntax::Disjunction(ref terms) => {
+@@ -569,17 +758,18 @@ impl Syntax {
+                     input.reset(start.clone())
+                 }
+                 Err(ParseError::Custom(SelectorParseError::Custom(StyleParseError::UnspecifiedError)))
+             },
+         }
+     }
+ }
+ 
+-#[derive(Clone, HeapSizeOf, ToCss)]
++#[derive(Clone, ToCss)]
++#[cfg_attr(feature = "servo", derive(HeapSizeOf))]
+ pub enum SpecifiedValueItem {
+     Length(specified::Length),
+     Number(specified::Number),
+     Percentage(specified::Percentage),
+     LengthPercentage(specified::LengthOrPercentage),
+     Color(specified::Color),
+     Image(specified::Image),
+     // need tocss Url(SpecifiedUrl),
+@@ -613,18 +803,23 @@ impl SpecifiedValueItem {
+         use self::values::Either::*;
+         use self::values::generics::transform::Matrix;
+ 
+         fn check_no_calc_length(length: &NoCalcLength) -> bool {
+             match *length {
+                 NoCalcLength::Absolute(_) => true,
+                 // XXX 0em should be computationally independent.
+                 NoCalcLength::FontRelative(_) => false,
+-                NoCalcLength::ViewportPercentage(_) => true,
++                NoCalcLength::ViewportPercentage(_) => false,
+                 NoCalcLength::ServoCharacterWidth(_) => false,
++                // mozmm, depends on DPI. Computation resolves to lengths in
++                // pixels and percentages, so these are not computationally
++                // independent.
++                #[cfg(feature = "gecko")]
++                NoCalcLength::Physical(_) => false,
+             }
+         }
+ 
+         fn check_calc(calc: &Box<CalcLengthOrPercentage>) -> bool {
+             for part in &[&(**calc).em, &(**calc).ex, &(**calc).ch, &(**calc).rem] {
+                 match **part {
+                     None | Some(0.0) => (),
+                     Some(_) => return false,
+@@ -784,17 +979,18 @@ impl SpecifiedValueItem {
+             Length, Number, Percentage, LengthPercentage, Color, Image, Integer,
+             Angle, Time, TransformList
+         }
+     }
+ }
+ 
+ //#[derive(ToComputedValue)]
+ //looks like this is for computing sub-elements
+-#[derive(Clone, HeapSizeOf, ToCss)]
++#[derive(Clone, ToCss)]
++#[cfg_attr(feature = "servo", derive(HeapSizeOf))]
+ pub enum SpecifiedValue {
+     Item(SpecifiedValueItem),
+     // Note: can't have lists of <transform-list>s!
+     List(Vec<SpecifiedValueItem>),
+ }
+ 
+ impl SpecifiedValue {
+     pub fn is_computationally_independent(&self) -> bool {
+@@ -822,17 +1018,18 @@ impl SpecifiedValue {
+                         })
+                     })
+                     .map(|list| ComputedValue::List(list))
+             },
+         }
+     }
+ }
+ 
+-#[derive(Clone, Debug, HeapSizeOf, ToCss)]
++#[derive(Clone, Debug, ToCss)]
++#[cfg_attr(feature = "servo", derive(HeapSizeOf))]
+ pub enum ComputedValueItem {
+     Length(computed::Length),
+     Number(computed::Number),
+     Percentage(computed::Percentage),
+     LengthPercentage(computed::LengthOrPercentage),
+     Color(computed::Color),
+     Image(computed::Image),
+     // XXX apparently we store them all as this?
+@@ -842,17 +1039,18 @@ pub enum ComputedValueItem {
+     Time(computed::Time),
+     //Resolution(specified::Resolution),
+     TransformList(transform::computed_value::T),
+     CustomIdent(Ident),
+     SpecificIdent(Ident),
+     TokenStream(custom_properties::SpecifiedValue),
+ }
+ 
+-#[derive(Clone, Debug, HeapSizeOf, ToCss)]
++#[derive(Clone, Debug, ToCss)]
++#[cfg_attr(feature = "servo", derive(HeapSizeOf))]
+ pub enum ComputedValue {
+     Item(ComputedValueItem),
+     List(Vec<ComputedValueItem>),
+ }
+ 
+ impl OneOrMoreSeparated for ComputedValueItem {
+     type S = Space;
+ }
+diff -r d04bef274d51 -r c12161ca8728 components/style_traits/Cargo.toml
+--- a/components/style_traits/Cargo.toml	Thu Jul 27 13:21:13 2017 -0700
++++ b/components/style_traits/Cargo.toml	Tue Aug 01 14:16:22 2017 -0700
+@@ -17,9 +17,8 @@ gecko = []
+ app_units = "0.5"
+ bitflags = "0.7"
+ cssparser = "0.18"
+ euclid = "0.15"
+ heapsize = {version = "0.4", optional = true}
+ heapsize_derive = {version = "0.1", optional = true}
+ selectors = { path = "../selectors" }
+ serde = {version = "1.0", optional = true}
+-servo_atoms = { path = "../atoms" }
+diff -r d04bef274d51 -r c12161ca8728 components/style_traits/lib.rs
+--- a/components/style_traits/lib.rs	Thu Jul 27 13:21:13 2017 -0700
++++ b/components/style_traits/lib.rs	Tue Aug 01 14:16:22 2017 -0700
+@@ -8,17 +8,16 @@
+ 
+ #![crate_name = "style_traits"]
+ #![crate_type = "rlib"]
+ 
+ #![deny(unsafe_code, missing_docs)]
+ 
+ #![cfg_attr(feature = "servo", feature(plugin))]
+ 
+-extern crate servo_atoms;
+ extern crate app_units;
+ #[macro_use] extern crate bitflags;
+ #[macro_use] extern crate cssparser;
+ extern crate euclid;
+ #[cfg(feature = "servo")] extern crate heapsize;
+ #[cfg(feature = "servo")] #[macro_use] extern crate heapsize_derive;
+ extern crate selectors;
+ #[cfg(feature = "servo")] #[macro_use] extern crate serde;
+diff -r d04bef274d51 -r c12161ca8728 components/style_traits/values.rs
+--- a/components/style_traits/values.rs	Thu Jul 27 13:21:13 2017 -0700
++++ b/components/style_traits/values.rs	Tue Aug 01 14:16:22 2017 -0700
+@@ -2,17 +2,16 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ //! Helper types and traits for the handling of CSS values.
+ 
+ use app_units::Au;
+ use cssparser::{BasicParseError, ParseError, Parser, Token, UnicodeRange, serialize_string};
+ use std::fmt::{self, Write};
+-use servo_atoms::Atom;
+ 
+ /// Serialises a value according to its CSS representation.
+ ///
+ /// This trait is implemented for `str` and its friends, serialising the string
+ /// contents as a CSS quoted string.
+ ///
+ /// This trait is derivable with `#[derive(ToCss)]`, with the following behaviour:
+ /// * unit variants get serialised as the `snake-case` representation
+@@ -177,23 +176,16 @@ where
+     fn write_char(&mut self, c: char) -> fmt::Result {
+         if let Some(prefix) = self.prefix.take() {
+             self.writer.write_str(prefix)?;
+         }
+         self.writer.write_char(c)
+     }
+ }
+ 
+-impl ToCss for Atom {
+-    #[inline]
+-    fn to_css<W>(&self, dest: &mut W) -> fmt::Result where W: fmt::Write {
+-        (**self).to_css(dest)
+-    }
+-}
+-
+ /// Type used as the associated type in the `OneOrMoreSeparated` trait on a
+ /// type to indicate that a serialized list of elements of this type is
+ /// separated by commas.
+ pub struct Comma;
+ 
+ /// Type used as the associated type in the `OneOrMoreSeparated` trait on a
+ /// type to indicate that a serialized list of elements of this type is
+ /// separated by spaces.
+diff -r d04bef274d51 -r c12161ca8728 ports/geckolib/glue.rs
+--- a/ports/geckolib/glue.rs	Thu Jul 27 13:21:13 2017 -0700
++++ b/ports/geckolib/glue.rs	Tue Aug 01 14:16:22 2017 -0700
+@@ -95,16 +95,17 @@ use style::parallel;
+ use style::parser::ParserContext;
+ use style::properties::{ComputedValues, Importance};
+ use style::properties::{IS_FIELDSET_CONTENT, LonghandIdSet};
+ use style::properties::{PropertyDeclaration, PropertyDeclarationBlock, PropertyId, ShorthandId};
+ use style::properties::{SKIP_ROOT_AND_ITEM_BASED_DISPLAY_FIXUP, SourcePropertyDeclaration, StyleBuilder};
+ use style::properties::animated_properties::{Animatable, AnimatableLonghand, AnimationValue};
+ use style::properties::animated_properties::compare_property_priority;
+ use style::properties::parse_one_declaration_into;
++use style::properties_and_values;
+ use style::rule_tree::StyleSource;
+ use style::selector_parser::PseudoElementCascadeType;
+ use style::sequential;
+ use style::shared_lock::{SharedRwLockReadGuard, StylesheetGuards, ToCssWithGuard, Locked};
+ use style::string_cache::Atom;
+ use style::style_adjuster::StyleAdjuster;
+ use style::stylesheets::{CssRule, CssRules, CssRuleType, CssRulesHelpers, DocumentRule};
+ use style::stylesheets::{ImportRule, KeyframesRule, MallocSizeOfWithGuard, MediaRule};
+@@ -3441,16 +3442,72 @@ pub extern "C" fn Servo_StyleSet_HasStat
+             has_dep = has_dep || stylist.might_have_state_dependency(state);
+         });
+     }
+ 
+     has_dep
+ }
+ 
+ #[no_mangle]
++#[allow(unused_variables)]
++pub extern "C" fn Servo_StyleSet_RegisterProperty(
++    raw_data: RawServoStyleSetBorrowed,
++    mut raw_url_extra_data: *mut URLExtraData,
++    name: *const nsAString,
++    syntax: *const nsAString,
++    inherits: bool,
++    initial_value_was_passed: bool,
++    maybe_initial_value: *const nsAString,
++) -> u8 {
++    let data = PerDocumentStyleData::from_ffi(raw_data).borrow_mut();
++    let url_extra_data = unsafe { RefPtr::from_ptr_ref(&mut raw_url_extra_data) };
++    let locked = data.stylist.registered_property_set();
++    let mut registered_property_set = locked.write();
++    let name = unsafe { (*name).to_string() };
++    let syntax = unsafe { (*syntax).to_string() };
++    let initial_value = if initial_value_was_passed {
++        Some(unsafe { (*maybe_initial_value).to_string() })
++    } else {
++        None
++    };
++
++    properties_and_values::register_property(
++        &mut *registered_property_set,
++        &ParserContext::new_for_cssom(
++            url_extra_data,
++            &NullReporter,
++            /* rule_type */ None,
++            PARSING_MODE_DEFAULT,
++            data.stylist.quirks_mode(),
++        ),
++        &name,
++        &syntax,
++        inherits,
++        initial_value.as_ref().map(|x| &**x),
++    ) as u8
++}
++
++#[no_mangle]
++#[allow(unused_variables)]
++pub extern "C" fn Servo_StyleSet_UnregisterProperty(
++    raw_data: RawServoStyleSetBorrowed,
++    name: *const nsAString
++) -> u8 {
++    let data = PerDocumentStyleData::from_ffi(raw_data).borrow_mut();
++    let locked = data.stylist.registered_property_set();
++    let mut registered_property_set = locked.write();
++    let name = unsafe { (*name).to_string() };
++
++    properties_and_values::unregister_property(
++        &mut *registered_property_set,
++        &name,
++    ) as u8
++}
++
++#[no_mangle]
+ pub extern "C" fn Servo_GetCustomPropertyValue(computed_values: ServoStyleContextBorrowed,
+                                                name: *const nsAString,
+                                                value: *mut nsAString) -> bool {
+     let custom_properties = match computed_values.custom_properties() {
+         Some(p) => p,
+         None => return false,
+     };
+ 
+diff -r d04bef274d51 -r c12161ca8728 tests/wpt/web-platform-tests/css/css-properties-values-api-1/independence.html
+--- a/tests/wpt/web-platform-tests/css/css-properties-values-api-1/independence.html	Thu Jul 27 13:21:13 2017 -0700
++++ b/tests/wpt/web-platform-tests/css/css-properties-values-api-1/independence.html	Tue Aug 01 14:16:22 2017 -0700
+@@ -9,16 +9,20 @@
+ let independencePassTests = [
+   // https://github.com/w3c/css-houdini-drafts/issues/247
+   { syntax: "<color>", initialValue: "currentColor" },
+   { syntax: "<length>", initialValue: "5px" },
+   { syntax: "<length>", initialValue: "calc(5px + 7px)" },
+   { syntax: "<transform-list>", initialValue: "translateX(5px)" },
+   { syntax: "<transform-list>+", initialValue: "translateX(5px) translateX(-10px)" },
+   { syntax: "<custom-ident>+", initialValue: "does the code inherit the legacy of Netscape" },
++  // Note that percentages don't compute to absolute lengths for registered
++  // custom properties.
++  // https://drafts.css-houdini.org/css-properties-values-api-1/#calculation-of-computed-values
++  { syntax: "<length-percentage>", initialValue: "100%" },
+ ];
+ 
+ let independenceFailTests = [
+   { syntax: "<color>", initialValue: "inherit" },
+   { syntax: "<length>", initialValue: "5em" },
+   { syntax: "<length>", initialValue: "calc(5px + 5em)" },
+   { syntax: "<transform-list>", initialValue: "translateX(5em)" },
+   { syntax: "<integer> | <length>+", initialValue: "5px 0 -5em 0 12px" },
